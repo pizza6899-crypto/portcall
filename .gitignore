@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Personal working notes (host paths, tunnel URLs, migration steps)
+NOTES.local.md
+*.local.md
+
+# OS / editor
+.DS_Store
