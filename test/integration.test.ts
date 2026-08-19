@@ -32,13 +32,13 @@ describe('mounts and routing', () => {
     assert.ok(names(canonical).length > 0, 'expected the vault plugin to expose tools');
   });
 
-  test('unknown paths 404 and list the mounts that do exist', async () => {
+  test('unknown paths 404 without disclosing what does exist', async () => {
     const res = await fetch(`${server.baseUrl}/nope/mcp`, { method: 'POST' });
     assert.equal(res.status, 404);
 
-    const body = (await res.json()) as { error: string; mounts: string[] };
+    const body = (await res.json()) as Record<string, unknown>;
     assert.equal(body.error, 'not_found');
-    assert.ok(body.mounts.includes('/vault/mcp'));
+    assert.equal('mounts' in body, false, '404 must not leak the mount table');
   });
 
   test('a trailing slash resolves to the same mount', async () => {
@@ -150,5 +150,70 @@ describe('bearer authentication', () => {
       authorization: `bearer ${token}`,
     });
     assert.equal(res.status, 200);
+  });
+});
+
+describe('secret path prefix', () => {
+  let server: RunningServer;
+  const prefix = 'k7f3q9x2';
+
+  before(async () => {
+    server = await startServer({ PORTCALL_PATH_PREFIX: prefix, PORTCALL_ALIAS_ROOT_MCP: 'vault' });
+  });
+  after(async () => server.stop());
+
+  test('mounts are served behind the prefix', async () => {
+    const res = await modernRequest(server.baseUrl, `/${prefix}/vault/mcp`, 'tools/list');
+    assert.equal(res.status, 200);
+  });
+
+  test('the alias moves behind the prefix too', async () => {
+    const res = await modernRequest(server.baseUrl, `/${prefix}/mcp`, 'tools/list');
+    assert.equal(res.status, 200);
+  });
+
+  test('the unprefixed paths are gone', async () => {
+    for (const path of ['/vault/mcp', '/mcp']) {
+      const res = await modernRequest(server.baseUrl, path, 'tools/list');
+      assert.equal(res.status, 404, `${path} should no longer be served`);
+    }
+  });
+
+  test('a wrong prefix does not reach the plugin', async () => {
+    const res = await modernRequest(server.baseUrl, '/wrongprefix/vault/mcp', 'tools/list');
+    assert.equal(res.status, 404);
+  });
+
+  test('the public health endpoint stays alive but hides the mounts', async () => {
+    const res = await fetch(`${server.baseUrl}/healthz`);
+    assert.equal(res.status, 200);
+
+    const body = (await res.json()) as Record<string, unknown>;
+    assert.equal(body.status, 'ok');
+    assert.equal('mounts' in body, false, 'public health must not leak the secret path');
+    assert.equal(JSON.stringify(body).includes(prefix), false, 'the prefix must not appear in the public payload');
+  });
+
+  test('the mount listing is available behind the prefix', async () => {
+    const res = await fetch(`${server.baseUrl}/${prefix}/healthz`);
+    assert.equal(res.status, 200);
+
+    const body = (await res.json()) as { mounts: { route: string }[] };
+    assert.deepEqual(body.mounts.map((m) => m.route).sort(), [`/${prefix}/mcp`, `/${prefix}/vault/mcp`]);
+  });
+
+  test('a 404 body reveals nothing about the prefix', async () => {
+    const res = await fetch(`${server.baseUrl}/guess/mcp`, { method: 'POST' });
+    assert.equal(res.status, 404);
+    assert.equal((await res.text()).includes(prefix), false);
+  });
+});
+
+describe('a misconfigured prefix stops the server rather than serving something unintended', () => {
+  test('a prefix containing a slash is refused at startup', async () => {
+    await assert.rejects(
+      () => startServer({ PORTCALL_PATH_PREFIX: 'a/b' }),
+      /server exited early/,
+    );
   });
 });

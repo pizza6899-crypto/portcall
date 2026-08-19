@@ -51,6 +51,16 @@ export const config = {
   aliasRootMcp: optional('PORTCALL_ALIAS_ROOT_MCP'),
 
   /**
+   * Secret path segment to serve every mount under, turning `/vault/mcp` into
+   * `/<prefix>/vault/mcp`. Unset serves the mounts at their bare paths.
+   *
+   * For clients that cannot send an `Authorization` header, the URL is the only
+   * channel left that can carry a secret. Treat it as one: it reaches proxy
+   * logs, so it raises the bar rather than replacing authentication.
+   */
+  pathPrefix: optional('PORTCALL_PATH_PREFIX'),
+
+  /**
    * SSE comment-frame keepalive interval, in milliseconds. `0` disables it.
    * Some reverse proxies withhold response headers until the first body byte
    * arrives; a shorter interval makes streams surface faster behind those.

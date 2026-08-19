@@ -88,6 +88,7 @@ All host-specific values come from the environment.
 | `PORTCALL_HOST` | `127.0.0.1` | Bind interface |
 | `PORTCALL_TOKEN` | *(unset)* | Static bearer token. Unset means no authentication |
 | `PORTCALL_ALIAS_ROOT_MCP` | *(unset)* | Also mount the named plugin at `/mcp` |
+| `PORTCALL_PATH_PREFIX` | *(unset)* | Serve every mount under `/<prefix>/…` |
 | `PORTCALL_KEEPALIVE_MS` | `15000` | SSE keepalive interval; `0` disables |
 | `PORTCALL_MODERN_ONLY` | `false` | Reject 2025-era requests instead of serving them |
 
@@ -95,6 +96,21 @@ All host-specific values come from the environment.
 that some MCP clients — Claude's custom connector UI among them — offer no way
 to set a request header, so for those the token has to be enforced upstream
 instead (or left off, with access controlled at the network layer).
+
+`PORTCALL_PATH_PREFIX` is the fallback for exactly those clients: it moves every
+mount under a segment you choose, so `/vault/mcp` becomes `/<prefix>/vault/mcp`
+and the URL itself carries the secret. Two things follow from that, and the
+server enforces both:
+
+- `404` responses say only `not_found`. They never list what is mounted.
+- The mount listing moves out of the public `/healthz` and into
+  `/<prefix>/healthz`. The bare `/healthz` still answers, so liveness probes
+  keep working, but it discloses no paths.
+
+Treat a path prefix as weaker than a header. URLs reach proxy access logs,
+crash reports, and anything that records a destination, and a leaked one grants
+the same access a leaked token would. It raises the bar — it is not
+authentication.
 
 Which plugins are mounted, and where, is declared in `plugins.config.ts`.
 

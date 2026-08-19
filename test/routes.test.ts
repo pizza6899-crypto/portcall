@@ -1,7 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { resolveMounts, routeKey } from '../src/routes.js';
+import { detailedHealthRoute, resolveMounts, routeKey } from '../src/routes.js';
 import type { Plugin } from '../src/types.js';
 
 /** A plugin stub — resolveMounts never touches the handler. */
@@ -17,7 +17,7 @@ describe('resolveMounts', () => {
 
   test('an alias points at the very same plugin instance', () => {
     const vault = stub('vault', 'vault');
-    const mounts = resolveMounts([vault], 'vault');
+    const mounts = resolveMounts([vault], { aliasRootMcp: 'vault' });
 
     assert.equal(mounts.get('/mcp'), vault);
     assert.equal(mounts.get('/vault/mcp'), vault);
@@ -32,7 +32,7 @@ describe('resolveMounts', () => {
 
   test('an alias naming an unknown plugin fails loudly at startup', () => {
     assert.throws(
-      () => resolveMounts([stub('vault', 'vault')], 'typo'),
+      () => resolveMounts([stub('vault', 'vault')], { aliasRootMcp: 'typo' }),
       /unknown plugin path: typo/,
     );
   });
@@ -45,11 +45,11 @@ describe('resolveMounts', () => {
   });
 
   test('a path containing a slash is rejected', () => {
-    assert.throws(() => resolveMounts([stub('nested', 'a/b')]), /invalid mount path/);
+    assert.throws(() => resolveMounts([stub('nested', 'a/b')]), /Plugin "nested" mount path must be a single non-empty path segment/);
   });
 
   test('an empty path is rejected', () => {
-    assert.throws(() => resolveMounts([stub('blank', '')]), /invalid mount path/);
+    assert.throws(() => resolveMounts([stub('blank', '')]), /Plugin "blank" mount path must be a single non-empty path segment/);
   });
 
   test('no plugins yields no mounts', () => {
@@ -79,5 +79,55 @@ describe('routeKey', () => {
   test('percent-encoded separators do not smuggle in a different route', () => {
     // %2F stays encoded in pathname, so this cannot resolve to /vault/mcp.
     assert.notEqual(routeKey('/vault%2Fmcp'), '/vault/mcp');
+  });
+});
+
+describe('resolveMounts with a secret path prefix', () => {
+  const opts = { aliasRootMcp: 'vault', pathPrefix: 's3cr3t' };
+
+  test('every mount moves behind the prefix', () => {
+    const mounts = resolveMounts([stub('vault', 'vault')], opts);
+    assert.deepEqual([...mounts.keys()].sort(), ['/s3cr3t/mcp', '/s3cr3t/vault/mcp']);
+  });
+
+  test('the unprefixed paths stop existing', () => {
+    const mounts = resolveMounts([stub('vault', 'vault')], opts);
+    assert.equal(mounts.has('/vault/mcp'), false);
+    assert.equal(mounts.has('/mcp'), false);
+  });
+
+  test('the alias still resolves to the same instance', () => {
+    const vault = stub('vault', 'vault');
+    const mounts = resolveMounts([vault], opts);
+    assert.equal(mounts.get('/s3cr3t/mcp'), vault);
+    assert.equal(mounts.get('/s3cr3t/mcp'), mounts.get('/s3cr3t/vault/mcp'));
+  });
+
+  test('an alias naming an unknown plugin still fails', () => {
+    assert.throws(
+      () => resolveMounts([stub('vault', 'vault')], { aliasRootMcp: 'typo', pathPrefix: 's3cr3t' }),
+      /unknown plugin path: typo/,
+    );
+  });
+
+  test('a prefix containing a slash is rejected', () => {
+    assert.throws(
+      () => resolveMounts([stub('vault', 'vault')], { pathPrefix: 'a/b' }),
+      /PORTCALL_PATH_PREFIX must be a single non-empty path segment/,
+    );
+  });
+
+  test('an empty prefix is rejected rather than silently ignored', () => {
+    assert.throws(() => resolveMounts([stub('vault', 'vault')], { pathPrefix: '' }), /PORTCALL_PATH_PREFIX/);
+  });
+});
+
+describe('detailedHealthRoute', () => {
+  test('stays at /healthz when no prefix is configured', () => {
+    assert.equal(detailedHealthRoute(undefined), '/healthz');
+  });
+
+  test('moves behind the prefix, so the mount listing is not guessable', () => {
+    assert.equal(detailedHealthRoute('s3cr3t'), '/s3cr3t/healthz');
   });
 });
