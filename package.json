@@ -6,11 +6,11 @@
   "description": "Plugin gateway that exposes local MCP servers over HTTP",
   "license": "MIT",
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "start": "node dist/src/server.js",
+    "dev": "tsx watch --env-file-if-exists=.env src/server.ts",
+    "start": "node --env-file-if-exists=.env dist/src/server.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

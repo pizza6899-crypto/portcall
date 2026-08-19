@@ -100,14 +100,21 @@ Which plugins are mounted, and where, is declared in `plugins.config.ts`.
 
 ## Running
 
+Requires Node 24 (see `.nvmrc`).
+
 ```bash
 npm install
 npm run build
-PORTCALL_VAULT_PATH=/path/to/vault npm start
+cp .env.example .env    # then set PORTCALL_VAULT_PATH
+npm start
 ```
 
-For development, `npm run dev` runs the entry point through `tsx` with watch.
-The daemon should run the built output, not `tsx`.
+Both `npm start` and `npm run dev` load `.env` if it is present and start
+without it if it is not, so a daemon can inject the environment directly
+instead. Variables already set in the environment are not overridden.
+
+`npm run dev` runs the entry point through `tsx` with watch. A daemon should
+run the built output, not `tsx`.
 
 Check it is up:
 
