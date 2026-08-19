@@ -1,37 +1,17 @@
 import { createServer as createHttpServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { timingSafeEqual } from 'node:crypto';
 
 import { toNodeHandler } from '@modelcontextprotocol/node';
 import type { NodeIncomingMessageLike, NodeMcpRequestHandler } from '@modelcontextprotocol/node';
 
 import { plugins } from '../plugins.config.js';
+import { isAuthorized } from './auth.js';
 import { config } from './config.js';
 import { log } from './log.js';
+import { resolveMounts, routeKey } from './routes.js';
 import type { Plugin } from './types.js';
 
 const startedAt = Date.now();
-
-/** Constant-time string compare that tolerates differing lengths. */
-function secretEquals(a: string, b: string): boolean {
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) {
-    // Still compare, so the branch cost does not leak the length.
-    timingSafeEqual(bufA, bufA);
-    return false;
-  }
-  return timingSafeEqual(bufA, bufB);
-}
-
-function isAuthorized(req: IncomingMessage): boolean {
-  if (config.token === undefined) return true;
-  const header = req.headers.authorization;
-  if (typeof header !== 'string') return false;
-  const [scheme, ...rest] = header.split(' ');
-  if (scheme?.toLowerCase() !== 'bearer') return false;
-  return secretEquals(rest.join(' ').trim(), config.token);
-}
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
@@ -42,40 +22,38 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
-/** Build the `/<path>/mcp` route table, plus the optional `/mcp` alias. */
-function buildRoutes(mounted: Plugin[]): Map<string, { plugin: Plugin; handle: NodeMcpRequestHandler }> {
-  const routes = new Map<string, { plugin: Plugin; handle: NodeMcpRequestHandler }>();
+interface Route {
+  plugin: Plugin;
+  handle: NodeMcpRequestHandler;
+}
 
-  for (const plugin of mounted) {
-    if (plugin.path.includes('/')) {
-      throw new Error(`Plugin "${plugin.name}" has an invalid mount path: ${plugin.path}`);
+/**
+ * Adapt each mounted plugin to a Node request handler.
+ *
+ * Aliased routes share one plugin instance, so they share one adapter too.
+ */
+function buildRoutes(mounts: Map<string, Plugin>): Map<string, Route> {
+  const adapters = new Map<Plugin, NodeMcpRequestHandler>();
+  const routes = new Map<string, Route>();
+
+  for (const [route, plugin] of mounts) {
+    let handle = adapters.get(plugin);
+    if (handle === undefined) {
+      handle = toNodeHandler(plugin.handler, {
+        onerror: (error) => log.error('request failed', { plugin: plugin.name, error: error.message }),
+      });
+      adapters.set(plugin, handle);
     }
-    const route = `/${plugin.path}/mcp`;
-    if (routes.has(route)) {
-      throw new Error(`Two plugins are mounted at ${route}`);
-    }
-    const handle = toNodeHandler(plugin.handler, {
-      onerror: (error) => log.error('request failed', { plugin: plugin.name, error: error.message }),
-    });
     routes.set(route, { plugin, handle });
-  }
-
-  const alias = config.aliasRootMcp;
-  if (alias !== undefined) {
-    const target = routes.get(`/${alias}/mcp`);
-    if (target === undefined) {
-      throw new Error(`PORTCALL_ALIAS_ROOT_MCP points at unknown plugin path: ${alias}`);
-    }
-    routes.set('/mcp', target);
   }
 
   return routes;
 }
 
-const routes = buildRoutes(plugins);
+const routes = buildRoutes(resolveMounts(plugins, config.aliasRootMcp));
 
-const httpServer = createHttpServer((req, res) => {
-  const pathname = new URL(req.url ?? '/', 'http://localhost').pathname.replace(/\/+$/, '') || '/';
+const httpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) => {
+  const pathname = routeKey(req.url);
 
   if (pathname === '/healthz') {
     json(res, 200, {
@@ -93,7 +71,7 @@ const httpServer = createHttpServer((req, res) => {
     return;
   }
 
-  if (!isAuthorized(req)) {
+  if (!isAuthorized(req.headers.authorization, config.token)) {
     res.setHeader('www-authenticate', 'Bearer');
     json(res, 401, { error: 'unauthorized' });
     return;

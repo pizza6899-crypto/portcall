@@ -122,11 +122,30 @@ Check it is up:
 curl -s localhost:7100/healthz
 ```
 
+## Tests
+
+```bash
+npm test        # builds, then runs unit and integration tests
+npm run typecheck
+```
+
+No test dependencies: the runner is `node:test`, and `tsx` (already needed for
+`npm run dev`) loads the TypeScript.
+
+The integration tests are black-box. They spawn the built server against a
+throwaway vault on an ephemeral port and drive it over real HTTP, so they
+exercise the same artifact a daemon runs — routing, the `/mcp` alias, bearer
+auth, and both protocol eras. The unit tests cover mount resolution and the
+bearer check, where a silent regression would look like a dead client rather
+than an error.
+
 ## Layout
 
 ```
 src/
-  server.ts            HTTP entry point, routing, auth, health, shutdown
+  server.ts            HTTP entry point, wiring, health, shutdown
+  routes.ts            mount resolution and URL normalisation
+  auth.ts              bearer token check
   config.ts            environment parsing
   log.ts               structured logging
   types.ts             the Plugin interface
@@ -135,6 +154,11 @@ src/
   plugins/
     vault.ts           mcpvault
 plugins.config.ts      which plugins mount at which paths
+test/
+  integration.test.ts  black-box tests against the built server
+  routes.test.ts       mount resolution
+  auth.test.ts         bearer token check
+  helpers.ts           server harness and MCP request builders
 ```
 
 ## License
