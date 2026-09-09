@@ -7,7 +7,7 @@ import type { NodeIncomingMessageLike, NodeMcpRequestHandler } from '@modelconte
 import { plugins } from '../plugins.config.js';
 import { isAuthorized } from './auth.js';
 import { config } from './config.js';
-import { log } from './log.js';
+import { describeHeaders, digest, log } from './log.js';
 import { detailedHealthRoute, resolveMounts, routeKey } from './routes.js';
 import type { Plugin } from './types.js';
 
@@ -57,6 +57,16 @@ const healthRoute = detailedHealthRoute(config.pathPrefix);
 
 const httpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) => {
   const pathname = routeKey(req.url);
+  log.info('request', {
+    method: req.method,
+    pathname,
+    ...(config.logHeaders
+      ? { headers: describeHeaders(req.headers) }
+      : {
+          xForwardedFor: req.headers['x-forwarded-for'],
+          cfConnectingIp: req.headers['cf-connecting-ip'],
+        }),
+  });
 
   // Liveness only. When a secret prefix is configured this is the public face,
   // so it must not disclose where anything is mounted.
@@ -80,6 +90,11 @@ const httpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) 
   }
 
   if (!isAuthorized(req.headers.authorization, config.token)) {
+    // Naming the digest the server expected turns "wrong token" and "no token
+    // at all" into two distinguishable failures from the log alone.
+    if (config.logHeaders && config.token !== undefined) {
+      log.warn('rejected', { pathname, expectedToken: digest(config.token) });
+    }
     res.setHeader('www-authenticate', 'Bearer');
     json(res, 401, { error: 'unauthorized' });
     return;

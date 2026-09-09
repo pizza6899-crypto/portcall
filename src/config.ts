@@ -69,6 +69,14 @@ export const config = {
 
   /** Reject 2025-era (pre-`2026-07-28`) requests instead of serving them statelessly. */
   modernOnly: boolean('PORTCALL_MODERN_ONLY', false),
+
+  /**
+   * Log every request header, with sensitive values reduced to a digest.
+   *
+   * Off by default: it is a diagnostic for bringing up a new client, not
+   * something to leave running against a log file that grows unattended.
+   */
+  logHeaders: boolean('PORTCALL_LOG_HEADERS', false),
 };
 
 export type Config = typeof config;
