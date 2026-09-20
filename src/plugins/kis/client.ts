@@ -24,24 +24,46 @@ export const REAL_BASE_URL = 'https://openapi.koreainvestment.com:9443';
 /** Paper-trading domain. Quotation tr_ids are shared, but coverage is thinner. */
 export const PAPER_BASE_URL = 'https://openapivts.koreainvestment.com:29443';
 
+/**
+ * The width suffix on an endpoint's continuation cursor, or `null` when the
+ * endpoint returns everything in one page.
+ *
+ * KIS names the cursor pair after how wide the opaque value is. Most account
+ * inquiries take `CTX_AREA_FK200`/`CTX_AREA_NK200`, the daily transaction
+ * ledger takes 100, the rights calendar 50, and the settlement calendar
+ * leaves the number off altogether.
+ *
+ * Sending the wrong width is not an error. The server ignores parameters it
+ * does not recognise, answers with the first page again, and `getAll` ends
+ * the walk on its repeated-resume-point guard — so the caller is handed page
+ * one with nothing to say the rest exists. That failure is silent, which is
+ * why this is declared per endpoint instead of defaulting to the common one.
+ */
+export type CursorWidth = '200' | '100' | '50' | '' | null;
+
 export interface Endpoint {
   path: string;
   trId: string;
+  cursor: CursorWidth;
 }
 
 /** Every endpoint this plugin may call. All of them read. */
 export const ENDPOINTS = {
   // Quotations — no account involved.
-  price: { path: '/uapi/overseas-price/v1/quotations/price', trId: 'HHDFS00000300' },
-  priceDetail: { path: '/uapi/overseas-price/v1/quotations/price-detail', trId: 'HHDFS76200200' },
-  dailyPrice: { path: '/uapi/overseas-price/v1/quotations/dailyprice', trId: 'HHDFS76240000' },
-  askingPrice: { path: '/uapi/overseas-price/v1/quotations/inquire-asking-price', trId: 'HHDFS76200100' },
-  fxRate: { path: '/uapi/overseas-price/v1/quotations/inquire-daily-chartprice', trId: 'FHKST03030100' },
+  price: { path: '/uapi/overseas-price/v1/quotations/price', trId: 'HHDFS00000300', cursor: null },
+  priceDetail: { path: '/uapi/overseas-price/v1/quotations/price-detail', trId: 'HHDFS76200200', cursor: null },
+  dailyPrice: { path: '/uapi/overseas-price/v1/quotations/dailyprice', trId: 'HHDFS76240000', cursor: null },
+  askingPrice: { path: '/uapi/overseas-price/v1/quotations/inquire-asking-price', trId: 'HHDFS76200100', cursor: null },
+  fxRate: { path: '/uapi/overseas-price/v1/quotations/inquire-daily-chartprice', trId: 'FHKST03030100', cursor: null },
   // Account inquiries — real-money tr_ids; the paper domain uses a `V` prefix.
-  holdings: { path: '/uapi/overseas-stock/v1/trading/inquire-balance', trId: 'TTTS3012R' },
-  balance: { path: '/uapi/overseas-stock/v1/trading/inquire-present-balance', trId: 'CTRP6504R' },
-  executions: { path: '/uapi/overseas-stock/v1/trading/inquire-ccnl', trId: 'TTTS3035R' },
-  realizedPnl: { path: '/uapi/overseas-stock/v1/trading/inquire-period-profit', trId: 'TTTS3039R' },
+  holdings: { path: '/uapi/overseas-stock/v1/trading/inquire-balance', trId: 'TTTS3012R', cursor: '200' },
+  balance: { path: '/uapi/overseas-stock/v1/trading/inquire-present-balance', trId: 'CTRP6504R', cursor: null },
+  executions: { path: '/uapi/overseas-stock/v1/trading/inquire-ccnl', trId: 'TTTS3035R', cursor: '200' },
+  realizedPnl: { path: '/uapi/overseas-stock/v1/trading/inquire-period-profit', trId: 'TTTS3039R', cursor: '200' },
+  // Rights — dividends among them. The per-share amount and the calendar come
+  // from different calls, and neither knows what is held: both are quotations.
+  rights: { path: '/uapi/overseas-price/v1/quotations/period-rights', trId: 'CTRGT011R', cursor: '50' },
+  rightsCalendar: { path: '/uapi/overseas-price/v1/quotations/rights-by-ice', trId: 'HHDFS78330900', cursor: null },
 } as const satisfies Record<string, Endpoint>;
 
 const ALLOWED_PATHS = new Set<string>(Object.values(ENDPOINTS).map((e) => e.path));
@@ -98,15 +120,32 @@ function cursor(body: Record<string, unknown>, key: string): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-/** The namespace KIS serves both account inquiries and orders from. */
-export const TRADING_NAMESPACE = '/uapi/overseas-stock/v1/trading/';
+/**
+ * The namespaces KIS serves both account inquiries and orders from.
+ *
+ * There is one per market. A path outside these is a quotation, where no
+ * ordering call exists to be confused with — but "outside these" has to mean
+ * a namespace nobody listed yet, not a market this list forgot. A domestic
+ * trading path added while only the overseas one was named here would pass
+ * the allowlist and skip the tr_id check entirely, which is the guard going
+ * quiet rather than failing.
+ */
+export const TRADING_NAMESPACES = [
+  '/uapi/overseas-stock/v1/trading/',
+  '/uapi/domestic-stock/v1/trading/',
+] as const;
+
+/** Whether a path sits in a namespace where reading and ordering share a prefix. */
+export function isTradingNamespace(path: string): boolean {
+  return TRADING_NAMESPACES.some((namespace) => path.startsWith(namespace));
+}
 
 /** Reject anything that is not an allowlisted inquiry, before it leaves the process. */
 function assertReadable(endpoint: Endpoint): void {
   if (!ALLOWED_PATHS.has(endpoint.path)) {
     throw new Error(`Refusing a KIS call outside the read allowlist: ${endpoint.path}`);
   }
-  if (endpoint.path.startsWith(TRADING_NAMESPACE) && !endpoint.trId.endsWith('R')) {
+  if (isTradingNamespace(endpoint.path) && !endpoint.trId.endsWith('R')) {
     throw new Error(`Refusing a KIS tr_id that is not an inquiry: ${endpoint.trId}`);
   }
 }
@@ -187,30 +226,42 @@ export function createKisClient(options: KisClientOptions): KisClient {
     },
 
     async getAll(endpoint, params, maxPages = DEFAULT_MAX_PAGES) {
+      if (endpoint.cursor === null) {
+        // Paging an endpoint that does not continue would send two parameters
+        // it has no name for and read a resume point that never arrives. Say
+        // so rather than return one page as though it were all of them.
+        throw new Error(`Refusing to page an endpoint that returns one page: ${endpoint.path}`);
+      }
+
+      const fkParam = `CTX_AREA_FK${endpoint.cursor}`;
+      const nkParam = `CTX_AREA_NK${endpoint.cursor}`;
+      const fkKey = fkParam.toLowerCase();
+      const nkKey = nkParam.toLowerCase();
+
       const pages: Record<string, unknown>[] = [];
       let continuation = '';
-      let fk200 = '';
-      let nk200 = '';
+      let fk = '';
+      let nk = '';
 
       for (let page = 0; page < maxPages; page += 1) {
         const { body, trCont } = await request(
           endpoint,
-          { ...params, CTX_AREA_FK200: fk200, CTX_AREA_NK200: nk200 },
+          { ...params, [fkParam]: fk, [nkParam]: nk },
           continuation,
         );
         pages.push(body);
 
         if (trCont !== 'F' && trCont !== 'M') break;
 
-        const nextFk = cursor(body, 'ctx_area_fk200');
-        const nextNk = cursor(body, 'ctx_area_nk200');
+        const nextFk = cursor(body, fkKey);
+        const nextNk = cursor(body, nkKey);
         // KIS says there is more but hands back the same resume point, so the
         // next request would return this page again. Stop rather than collect
         // the same rows `maxPages` times.
-        if (nextFk === fk200 && nextNk === nk200) break;
+        if (nextFk === fk && nextNk === nk) break;
 
-        fk200 = nextFk;
-        nk200 = nextNk;
+        fk = nextFk;
+        nk = nextNk;
         continuation = 'N';
       }
 

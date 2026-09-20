@@ -1,7 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ENDPOINTS, TRADING_NAMESPACE, createKisClient, type Endpoint } from '../src/plugins/kis/client.js';
+import { ENDPOINTS, createKisClient, isTradingNamespace, type Endpoint } from '../src/plugins/kis/client.js';
 
 const BASE = 'https://openapi.example.invalid';
 
@@ -57,7 +57,7 @@ describe('KIS client', () => {
   test('refuses a path outside the read allowlist', async () => {
     const { client, seen } = clientAnswering({ rt_cd: '0' });
 
-    const ordering = { path: '/uapi/overseas-stock/v1/trading/order', trId: 'TTTT1002U' } satisfies Endpoint;
+    const ordering = { path: '/uapi/overseas-stock/v1/trading/order', trId: 'TTTT1002U', cursor: '200' } satisfies Endpoint;
 
     await assert.rejects(() => client.get(ordering, {}), /outside the read allowlist/);
     assert.equal(seen.length, 0, 'the request must not leave the process');
@@ -68,7 +68,7 @@ describe('KIS client', () => {
 
     // Account inquiries share the /trading/ namespace with the order
     // endpoints, so the path alone no longer separates reading from trading.
-    const disguised = { path: ENDPOINTS.holdings.path, trId: 'TTTT1002U' } satisfies Endpoint;
+    const disguised = { path: ENDPOINTS.holdings.path, trId: 'TTTT1002U', cursor: '200' } satisfies Endpoint;
 
     await assert.rejects(() => client.get(disguised, {}), /not an inquiry: TTTT1002U/);
     assert.equal(seen.length, 0);
@@ -95,7 +95,7 @@ describe('KIS client', () => {
 
   test('every allowlisted endpoint is an inquiry', () => {
     for (const [name, endpoint] of Object.entries(ENDPOINTS)) {
-      if (endpoint.path.startsWith(TRADING_NAMESPACE)) {
+      if (isTradingNamespace(endpoint.path)) {
         // Orders live here too, and only the tr_id suffix tells them apart.
         assert.match(endpoint.trId, /R$/, `${name} must be an inquiry tr_id`);
       } else {
@@ -128,15 +128,62 @@ describe('KIS client', () => {
     assert.equal(seen[1]!.url.searchParams.get('CTX_AREA_FK200'), 'FK0');
   });
 
+  test('a paged call names the cursor the endpoint actually takes', async () => {
+    // The rights calendar pages on CTX_AREA_FK50, not the FK200 most account
+    // inquiries use. Sending the wrong width is not rejected: KIS drops the
+    // parameters it does not know and replays page one, so the walk would end
+    // on the repeated-cursor guard with the rest of the rows never fetched.
+    const { client, seen } = clientAnswering(
+      (call: number) => ({
+        rt_cd: '0',
+        output: [{ pdno: String(call) }],
+        ctx_area_fk50: `FK${call}`,
+        ctx_area_nk50: `NK${call}`,
+      }),
+      200,
+      ['M', 'D'],
+    );
+
+    const pages = await client.getAll(ENDPOINTS.rights, { RGHT_TYPE_CD: '03' });
+
+    assert.equal(pages.length, 2, 'the cursor must be read back from the body it was sent in');
+    assert.equal(seen[1]!.url.searchParams.get('CTX_AREA_FK50'), 'FK0');
+    assert.equal(seen[1]!.url.searchParams.get('CTX_AREA_NK50'), 'NK0');
+    assert.equal(seen[1]!.url.searchParams.get('CTX_AREA_FK200'), null, 'no cursor the endpoint has no name for');
+  });
+
+  test('refuses to page an endpoint that returns one page', async () => {
+    const { client, seen } = clientAnswering({ rt_cd: '0', output1: [{ a: 1 }] });
+
+    await assert.rejects(() => client.getAll(ENDPOINTS.balance, {}), /returns one page/);
+    assert.equal(seen.length, 0);
+  });
+
+  test('the tr_id guard covers every trading namespace, not just the overseas one', async () => {
+    const { client, seen } = clientAnswering({ rt_cd: '0' });
+
+    // Nothing is mounted under domestic stock today. The guard has to cover
+    // the namespace anyway: with only the overseas one named, the first
+    // domestic account inquiry added would take the tr_id check with it and
+    // an ordering tr_id would ride in on the allowlist alone.
+    const domestic = '/uapi/domestic-stock/v1/trading/order-cash';
+    const disguised = { path: domestic, trId: 'CTSC0008U', cursor: '100' } satisfies Endpoint;
+
+    assert.ok(isTradingNamespace(domestic), 'the domestic trading namespace must be guarded');
+    // It is refused twice over — off the allowlist, and on the tr_id.
+    await assert.rejects(() => client.get(disguised, {}), /outside the read allowlist/);
+    assert.equal(seen.length, 0);
+  });
+
   test('the exchange rate endpoint is a quotation, not an account call', () => {
     // It shares an endpoint family with the index charts, so it is worth
     // pinning that it stayed out of the /trading/ namespace.
     assert.ok(ENDPOINTS.fxRate.path.startsWith('/uapi/overseas-price/v1/quotations/'));
-    assert.equal(ENDPOINTS.fxRate.path.startsWith(TRADING_NAMESPACE), false);
+    assert.equal(isTradingNamespace(ENDPOINTS.fxRate.path), false);
   });
 
   test('the consolidated balance is an inquiry in the trading namespace', () => {
-    assert.ok(ENDPOINTS.balance.path.startsWith(TRADING_NAMESPACE));
+    assert.ok(isTradingNamespace(ENDPOINTS.balance.path));
     assert.match(ENDPOINTS.balance.trId, /R$/);
   });
 

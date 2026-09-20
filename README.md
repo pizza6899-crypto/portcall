@@ -254,11 +254,17 @@ There is no capital gains tax tool because KIS exposes no tax API.
 from; the filing figures themselves come from KIS's own year-end statement.
 
 Read-only is enforced three ways. No ordering tool is implemented, so none can
-be called; the client refuses any path outside the allowlist; and within
-`/uapi/overseas-stock/v1/trading/` — where account inquiries sit alongside the
-order endpoints — it refuses any tr_id that is not an inquiry. KIS ends
-inquiry tr_ids with `R` and orders with `U` (`TTTS3012R` reads a balance,
-`TTTT1002U` buys). All three are covered by tests.
+be called; the client refuses any path outside the allowlist; and within a
+trading namespace — where account inquiries sit alongside the order endpoints
+— it refuses any tr_id that is not an inquiry. KIS ends inquiry tr_ids with
+`R` and orders with `U` (`TTTS3012R` reads a balance, `TTTT1002U` buys). All
+three are covered by tests.
+
+There is one trading namespace per market, and the guard holds a list rather
+than the overseas one alone. Only overseas endpoints are mounted today, but a
+domestic account inquiry added against a single-namespace guard would take
+the tr_id check out with it and be waved through on the allowlist alone —
+the guard going quiet rather than failing.
 
 The access token needs care rather than cleverness. KIS issues one valid for 24
 hours but refuses a re-issue within a minute of the last (`EGW00133`), so the
@@ -270,6 +276,16 @@ into a single request.
 Account queries are paged: KIS signals more rows with `tr_cont` of `F` or `M`
 and expects the next request to echo the cursor from the previous body. The
 client walks that automatically, up to a page ceiling.
+
+The cursor's parameter name is not uniform — most account inquiries take
+`CTX_AREA_FK200`, the daily ledger takes 100, the rights calendar 50 — so
+each endpoint declares its own and one that does not page declares that
+instead. Sending the wrong width is not rejected: KIS drops parameters it
+does not recognise and replays the first page, which ends the walk on the
+repeated-cursor guard with the rest of the rows never fetched. Paging an
+endpoint that returns a single page is refused outright for the same reason,
+since handing back one page as though it were all of them is the failure that
+cannot be seen from the outside.
 
 `overseas_history` exists because backtesting wants more bars than a quote
 tool should hand back. Nineteen years of daily bars is 4,801 of them, which
