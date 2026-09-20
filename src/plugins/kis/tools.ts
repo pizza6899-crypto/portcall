@@ -481,6 +481,107 @@ const PNL_TOTAL_FIELDS = {
 } as const;
 
 /**
+ * One dividend as the rights calendar reports it.
+ *
+ * `alct_frcr_unpr` — 배정외화단가 — is the per-share amount, checked against a
+ * year of SGOV distributions (0.34664, 0.34761, 0.31291 …, on a ~100 dollar
+ * share) and against TQQQ and SOXL. The fields KIS names 주당배당금,
+ * `stkp_dvdn_frcr_amt2`/`3`/`4`, read 0.00000 on every cash dividend seen,
+ * and their currencies `crcy_cd2`/`3`/`4` come back empty; they appear to
+ * belong to the multi-currency option a `74` (배당옵션) row carries. They are
+ * left unmapped rather than given a name that would read as the amount,
+ * because taking the documented one on trust is how this gets reported as
+ * zero.
+ *
+ * `bass_dt` is the record date as KIS files it and `acpl_bass_dt` the one the
+ * market itself keeps, a day earlier for the US. Both are kept: the local one
+ * is what every other source prints, and it is what the calendar below joins on.
+ */
+const DIVIDEND_FIELDS = {
+  pdno: 'symbol',
+  std_pdno: 'standardSymbol',
+  prdt_name: 'name',
+  prdt_type_cd: 'marketCode',
+  rght_type_cd: 'rightType',
+  bass_dt: 'recordDate',
+  acpl_bass_dt: 'localRecordDate',
+  crcy_cd: 'currency',
+  alct_frcr_unpr: 'perShare',
+  cash_alct_rt: 'cashRatio',
+  stck_alct_rt: 'stockRatio',
+  sbsc_strt_dt: 'subscriptionStart',
+  sbsc_end_dt: 'subscriptionEnd',
+  dfnt_yn: 'confirmed',
+} as const;
+
+/**
+ * The same event from ICE, which knows the dates but not the amount.
+ *
+ * Between them the two calls answer different halves of one question: how
+ * much, and when it lands. Neither carries both.
+ */
+const CALENDAR_FIELDS = {
+  ca_title: 'event',
+  anno_dt: 'announcedDate',
+  record_dt: 'recordDate',
+  div_lock_dt: 'exDividendDate',
+  pay_dt: 'payDate',
+  lock_dt: 'exRightsDate',
+  validity_dt: 'validityDate',
+  effective_dt: 'effectiveDate',
+  local_end_dt: 'localInstructionDeadline',
+  delist_dt: 'delistDate',
+  redempt_dt: 'redemptionDate',
+  early_redempt_dt: 'earlyRedemptionDate',
+} as const;
+
+/** Rights types worth asking for by name. `%%` is KIS's own wildcard. */
+const RIGHT_TYPES = { dividend: '03', all: '%%' } as const;
+
+/** What ICE calls an ordinary cash dividend, as opposed to a split or a merger. */
+const CASH_DIVIDEND = '현금배당';
+
+/**
+ * How far before the window the ICE calendar is asked to start.
+ *
+ * Its range filters on the announcement date, not the record date, and the
+ * gap between the two is not small or steady: SGOV announces three weeks to
+ * two months ahead, and TQQQ published four quarterly record dates — one of
+ * them eleven months out — in a single announcement on 2026-01-20. Asked
+ * with no range at all it answers ±3 months of announcements, which joined
+ * one of twelve SGOV dividends; a year of lookback joined all twelve.
+ *
+ * The end needs no such margin: every event measured was announced on or
+ * before its record date, so an upcoming dividend is already announced and
+ * falls inside a window ending today.
+ */
+const CALENDAR_LOOKBACK_DAYS = 365;
+
+/**
+ * A date ICE knows only to the month, written with `00` for the day —
+ * `20260100`, `20251200`. They arrive on rows whose record date is still
+ * blank, as a placeholder until the real schedule is published, and they are
+ * not dates: parsed, they are either invalid or quietly the wrong month.
+ * They are marked rather than dropped, because "a dividend is expected in
+ * December" is worth knowing.
+ */
+function monthOnly(value: unknown): boolean {
+  return typeof value === 'string' && value.length === 8 && value.endsWith('00');
+}
+
+/** Flag a calendar row whose dates are placeholders rather than a schedule. */
+function withPrecision(event: Record<string, unknown>): Record<string, unknown> {
+  const rough = ['recordDate', 'exDividendDate', 'payDate'].some((key) => monthOnly(event[key]));
+  return rough ? { ...event, approximate: true } : event;
+}
+
+/** Countries the ICE calendar is keyed by. */
+const RIGHTS_COUNTRIES = { US: 'US', CN: 'CN', HK: 'HK', JP: 'JP', VN: 'VN' } as const;
+
+/** How many symbols one call will walk. Each one costs two KIS requests. */
+const MAX_DIVIDEND_SYMBOLS = 20;
+
+/**
  * KIS reports `change` as an unsigned magnitude and puts the direction in a
  * separate one-character code, so the two have to be read together — a bare
  * `change: "0.87"` on a day the stock fell reads as a gain. This decodes it.
@@ -626,6 +727,13 @@ function startOfYear(): string {
 function daysAgo(days: number): string {
   // Korea has no daylight saving, so a fixed day length is exact here.
   return stamp(new Date(Date.now() - days * 24 * 60 * 60 * 1000));
+}
+
+/** The same shift, from a given YYYYMMDD rather than from today. */
+function daysBefore(date: string, days: number): string {
+  const at = Date.UTC(Number(date.slice(0, 4)), Number(date.slice(4, 6)) - 1, Number(date.slice(6, 8)));
+  if (Number.isNaN(at)) return date;
+  return new Date(at - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10).replaceAll('-', '');
 }
 
 const READ_ONLY = { readOnlyHint: true, openWorldHint: true } as const;
@@ -817,6 +925,142 @@ function registerQuotationTools(server: McpServer, client: KisClient): void {
         `${currency}: ${String(head['last'] ?? '?')} (${quotedAs}), ${bars.length} ${period} bars${shortfall(from, to, span)}`,
         data,
       );
+    },
+  );
+
+  server.registerTool(
+    'overseas_dividends',
+    {
+      title: 'Overseas dividends',
+      description:
+        'Dividends declared on overseas stocks and ETFs: the per-share amount and record date from the rights calendar, joined where possible to the ex-dividend and payment dates ICE publishes. Give `symbols` for named holdings over the window, or omit it to sweep every overseas stock whose record date falls in it. Per symbol, `dividends` are the ones with an amount, `scheduled` are announced but not yet paid, and `unpriced` are dividends ICE reports inside the window that the amount feed has nothing for — the two sources do not always agree. Dates flagged `approximate` are known only to the month. This reports what was declared per share: it does not know what is held, so it multiplies nothing, and the withholding a payment arrives net of is in no KIS read API.',
+      inputSchema: z.object({
+        symbols: z
+          .array(symbol)
+          .max(MAX_DIVIDEND_SYMBOLS)
+          .optional()
+          .describe(`Up to ${MAX_DIVIDEND_SYMBOLS} tickers. Every overseas stock in the window when omitted.`),
+        startDate: yyyymmdd.optional().describe('First record date, YYYYMMDD. Defaults to a year back.'),
+        endDate: yyyymmdd.optional().describe('Last record date, YYYYMMDD. Defaults to today.'),
+        type: z
+          .enum(Object.keys(RIGHT_TYPES) as [keyof typeof RIGHT_TYPES])
+          .default('dividend')
+          .describe('`all` also returns splits, mergers and the rest, where the per-share amount is not populated.'),
+        country: z
+          .enum(Object.keys(RIGHTS_COUNTRIES) as [keyof typeof RIGHTS_COUNTRIES])
+          .default('US')
+          .describe('Which market the ex-dividend and payment dates are looked up in. Applies to every symbol asked for.'),
+        calendar: z
+          .boolean()
+          .default(true)
+          .describe('Look up the ex-dividend and payment dates. Ignored without `symbols`: ICE is queried one ticker at a time.'),
+      }),
+      annotations: READ_ONLY,
+    },
+    async ({ symbols, startDate, endDate, type, country, calendar }) => {
+      const from = startDate ?? daysAgo(365);
+      const to = endDate ?? today();
+
+      const declared = async (forSymbol: string) => {
+        const pages = await client.getAll(ENDPOINTS.rights, {
+          RGHT_TYPE_CD: RIGHT_TYPES[type],
+          // Record date rather than a subscription window: a dividend has no
+          // subscription, so `03` and `04` return nothing for one.
+          INQR_DVSN_CD: '02',
+          INQR_STRT_DT: from,
+          INQR_END_DT: to,
+          PDNO: forSymbol,
+          PRDT_TYPE_CD: '',
+        });
+        return collect(pages, 'output', DIVIDEND_FIELDS);
+      };
+
+      if (symbols === undefined) {
+        const rows = await declared('');
+        return result(`${rows.length} declared between ${from} and ${to}`, { from, to, type, dividends: rows });
+      }
+
+      const holdings = [];
+      for (const forSymbol of symbols) {
+        const dividends = await declared(forSymbol);
+        // The calendar is asked for a wider range than the amounts, because
+        // its range is on the announcement date. See CALENDAR_LOOKBACK_DAYS.
+        const all = calendar
+          ? asRows(
+              (await client.get(ENDPOINTS.rightsCalendar, {
+                NCOD: RIGHTS_COUNTRIES[country],
+                SYMB: forSymbol,
+                ST_YMD: daysBefore(from, CALENDAR_LOOKBACK_DAYS),
+                ED_YMD: to,
+              }))['output1'],
+              CALENDAR_FIELDS,
+            )
+          : [];
+        // ICE files splits, mergers and ticker changes in the same list. A
+        // stock split has no business in an answer about dividends.
+        const events = (type === 'dividend' ? all.filter((event) => event['event'] === CASH_DIVIDEND) : all).map(
+          withPrecision,
+        );
+
+        // The two calls agree on the local record date and on nothing else,
+        // so that is the join. A miss leaves the dates off rather than
+        // guessing at them.
+        const matched = new Set<number>();
+        const withDates = dividends.map((row) => {
+          const index = events.findIndex(
+            (event, at) =>
+              !matched.has(at) && event['recordDate'] !== '' && event['recordDate'] === row['localRecordDate'],
+          );
+          if (index === -1) return row;
+          matched.add(index);
+          const event = events[index]!;
+          return { ...row, exDividendDate: event['exDividendDate'], payDate: event['payDate'] };
+        });
+
+        // What is left over is three different things, and they are not
+        // interchangeable.
+        const horizon = to.slice(0, 6);
+        const scheduled: Record<string, unknown>[] = [];
+        const unpriced: Record<string, unknown>[] = [];
+
+        for (const [at, event] of events.entries()) {
+          if (matched.has(at)) continue;
+          const on = typeof event['recordDate'] === 'string' ? event['recordDate'] : '';
+
+          if (on === '') {
+            // A placeholder, with only a month to go on. Once that month is
+            // past the real schedule has been published and this row is the
+            // superseded draft of a dividend already listed above — SOXL
+            // carries three of them, all pointing at months gone by.
+            const when = String(event['payDate'] ?? '') || String(event['exDividendDate'] ?? '');
+            if (when !== '' && when.slice(0, 6) >= horizon) scheduled.push(event);
+          } else if (on > to) {
+            // Announced, not yet paid. The half the amounts cannot answer.
+            scheduled.push(event);
+          } else if (on >= from) {
+            // Inside the window, and the amount feed did not return it. Not
+            // an artefact — the two sources disagree, and ICE is the one with
+            // more: it reports SOXL dividends in March and June that the
+            // rights list has nothing for. Dropping these would quietly
+            // understate a year's income, which is the failure this tool
+            // exists to avoid, so they are surfaced without an amount rather
+            // than left out.
+            unpriced.push(event);
+          }
+          // Older than the window: only there because the calendar was
+          // widened to catch the announcement. Not reported.
+        }
+
+        holdings.push({ symbol: forSymbol, dividends: withDates, scheduled, unpriced });
+      }
+
+      const total = holdings.reduce((sum, held) => sum + held.dividends.length, 0);
+      return result(`${total} declared across ${symbols.length} symbols between ${from} and ${to}`, {
+        from,
+        to,
+        type,
+        symbols: holdings,
+      });
     },
   );
 }

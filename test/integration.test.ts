@@ -292,6 +292,7 @@ describe('the KIS plugin', () => {
         [
           'fx_rate',
           'overseas_daily_prices',
+          'overseas_dividends',
           'overseas_history',
           'overseas_index',
           'overseas_orderbook',
@@ -319,6 +320,7 @@ describe('the KIS plugin', () => {
         'fx_rate',
         'overseas_balance',
         'overseas_daily_prices',
+        'overseas_dividends',
         'overseas_executions',
         'overseas_history',
         'overseas_holdings',

@@ -238,8 +238,8 @@ Quotation tools, which need no account: `overseas_quote`,
 `overseas_quote_detail`, `overseas_daily_prices`, `overseas_orderbook` (ten
 levels a side, with the session summary), `overseas_history` (long cached
 series as CSV), `fx_rate` (exchange rate history for 14 currencies against
-the dollar) and `overseas_index` (Dow, Nasdaq Composite, Nasdaq 100,
-S&P 500).
+the dollar), `overseas_index` (Dow, Nasdaq Composite, Nasdaq 100, S&P 500)
+and `overseas_dividends`.
 
 Account tools, registered only when `KIS_ACCOUNT` is set: `overseas_balance`
 (the whole account in one call — every position, cash and margin per
@@ -248,6 +248,61 @@ currency, and totals including withdrawable cash), `overseas_holdings`
 (order and fill history, this year by default) and `overseas_realized_pnl`
 (realised gains per disposal with FX rates). Prices are public and a portfolio
 is not, so the two are opt-in separately.
+
+#### Dividends
+
+Two calls answer different halves of the question and neither answers both.
+The rights calendar (`period-rights`) has the per-share amount but no payment
+date; ICE's rights summary (`rights-by-ice`) has the ex-dividend and payment
+dates but no amount. `overseas_dividends` asks both and joins them on the
+record date the market itself keeps, leaving the dates off rather than
+guessing when they do not line up. Events with no amount yet are returned
+separately: those are the dividends declared but not paid.
+
+The two calls do not take the same window. The amounts are filtered by record
+date, the calendar by *announcement* date, and the gap between the two is
+neither small nor steady — SGOV announces three weeks to two months ahead,
+and TQQQ published four quarterly record dates, one of them eleven months
+out, in a single announcement. Asked with no range the calendar answers ±3
+months of announcements, which joined one of twelve SGOV dividends; asked for
+a year of lookback it joined all twelve. The end of the range needs no such
+margin, because every event measured was announced on or before its record
+date. The calendar has no continuation cursor and stopped at 50 rows for a
+ten-year range, so a long window on a monthly payer will silently lose its
+oldest rows.
+
+What comes back is not a clean feed. ICE files splits, mergers and ticker
+changes in the same list, so they are filtered out of an answer about
+dividends. Some rows carry dates known only to the month, written with `00`
+for the day — `20260100` — alongside an empty record date; those are
+placeholders, and parsed as dates they are either invalid or quietly the
+wrong month, so they are marked `approximate` rather than dropped. A dividend
+expected in December is worth knowing about; a fake date for it is not. Once
+that month has passed the real schedule has been published, and the
+placeholder is a superseded draft of a dividend already listed — so it is
+dropped rather than reported as still upcoming.
+
+The two feeds also disagree about what happened. ICE reports SOXL dividends
+in March and June that the rights list returns nothing for, so a calendar
+event inside the window with no amount against it is reported as `unpriced`
+rather than left out. Dropping those would quietly understate a year's
+income, which is the error this tool exists to correct.
+
+The per-share figure is `alct_frcr_unpr`, 배정외화단가. KIS also sends
+`stkp_dvdn_frcr_amt2`/`3`/`4`, named 주당배당외화금액, and those read
+`0.00000` on every cash dividend measured — a year of SGOV distributions,
+plus TQQQ and SOXL — while their currencies `crcy_cd2`/`3`/`4` come back
+empty. Mapping the documented name would have reported every dividend as
+zero, so the amount is the one that was checked against the live API and the
+others are passed through under KIS's own names.
+
+What it cannot do is say what was actually received. No KIS read API reports
+a dividend as it lands in the account: the account calls carry no dividend
+field at all, and the domestic 기간별계좌권리현황조회 (`CTRGA011R`), which
+does carry allotted amount and tax withheld, returns nothing for an overseas
+holding. So the tool reports what was declared per share, multiplies by no
+position — a past dividend against a present holding is a plausible wrong
+number — and the withholding a payment arrives net of is not available.
 
 There is no capital gains tax tool because KIS exposes no tax API.
 `overseas_realized_pnl` returns the disposal-level record a filing is built

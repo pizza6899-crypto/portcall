@@ -401,11 +401,11 @@ describe('the history tool', () => {
 });
 
 describe('what the KIS mount exposes', () => {
-  test('ten tools, every one of them read-only', async () => {
+  test('eleven tools, every one of them read-only', async () => {
     const tools = await openTools();
     try {
       const listed = await tools.listed();
-      assert.equal(listed.length, 10);
+      assert.equal(listed.length, 11);
       for (const tool of listed) {
         assert.equal(tool['annotations']?.readOnlyHint, true, `${tool['name']} is not marked read-only`);
       }
@@ -423,6 +423,7 @@ describe('what the KIS mount exposes', () => {
         'fx_rate',
         'overseas_balance',
         'overseas_daily_prices',
+        'overseas_dividends',
         'overseas_executions',
         'overseas_holdings',
         'overseas_index',
@@ -475,5 +476,261 @@ describe('what the KIS mount exposes', () => {
 
     await near.close();
     await server.close();
+  });
+});
+
+describe('overseas dividends', () => {
+  const DIVIDEND_BODY = {
+    rt_cd: '0',
+    output: [
+      {
+        pdno: 'SGOV',
+        prdt_name: 'ISHARES TRUST ISHARES 0-3 MONTH TREASURY BOND ETF',
+        prdt_type_cd: '529',
+        bass_dt: '20260902',
+        acpl_bass_dt: '20260901',
+        crcy_cd: 'USD',
+        alct_frcr_unpr: '0.34664',
+        stkp_dvdn_frcr_amt2: '0.00000',
+        dfnt_yn: 'Y',
+      },
+    ],
+    output1: [
+      { ca_title: '현금배당', record_dt: '20260901', div_lock_dt: '20260901', pay_dt: '20260904' },
+      { ca_title: '현금배당', record_dt: '20261001', div_lock_dt: '20261001', pay_dt: '20261006' },
+    ],
+  };
+
+  test('the per-share amount is the allotment price, not the field named for a dividend', async () => {
+    // KIS calls `stkp_dvdn_frcr_amt2` 주당배당외화금액 and sends 0.00000 in it
+    // on every cash dividend; the money is in 배정외화단가. Taking the
+    // documented name would report every dividend as zero.
+    const tools = await openTools(DIVIDEND_BODY);
+    try {
+      const data = (await tools.call('overseas_dividends', { symbols: ['SGOV'], calendar: false }))['result']
+        .structuredContent;
+      const [dividend] = data.symbols[0].dividends;
+
+      assert.equal(dividend.perShare, '0.34664');
+      assert.equal(dividend.currency, 'USD');
+      assert.equal(dividend.perShare, DIVIDEND_BODY.output[0]!.alct_frcr_unpr);
+      assert.notEqual(dividend.perShare, DIVIDEND_BODY.output[0]!.stkp_dvdn_frcr_amt2);
+      // Passed through under KIS's own name rather than mapped to something
+      // that would read as the amount.
+      assert.equal(dividend.stkp_dvdn_frcr_amt2, '0.00000');
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('a payment date is attached on the local record date, and unmatched events are kept', async () => {
+    const tools = await openTools(DIVIDEND_BODY);
+    try {
+      const data = (await tools.call('overseas_dividends', { symbols: ['SGOV'] }))['result'].structuredContent;
+      const held = data.symbols[0];
+
+      assert.equal(held.dividends[0].payDate, '20260904', 'joined on acpl_bass_dt, not bass_dt');
+      assert.equal(held.dividends[0].exDividendDate, '20260901');
+      assert.equal(held.scheduled.length, 1, 'a declared-but-unpaid dividend is still worth returning');
+      assert.equal(held.scheduled[0].recordDate, '20261001');
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('asks the rights calendar per symbol and the ICE calendar beside it', async () => {
+    const tools = await openTools(DIVIDEND_BODY);
+    try {
+      await tools.call('overseas_dividends', { symbols: ['SGOV', 'TQQQ'], startDate: '20260101', endDate: '20260601' });
+
+      const rights = tools.calls.filter((call) => call.endpoint.path.endsWith('/period-rights'));
+      const ice = tools.calls.filter((call) => call.endpoint.path.endsWith('/rights-by-ice'));
+
+      assert.deepEqual(
+        rights.map((call) => call.params['PDNO']),
+        ['SGOV', 'TQQQ'],
+      );
+      assert.equal(rights[0]?.params['RGHT_TYPE_CD'], '03', 'dividends only unless asked otherwise');
+      assert.equal(rights[0]?.params['INQR_DVSN_CD'], '02', 'record date, not a subscription window');
+      assert.equal(rights[0]?.params['INQR_STRT_DT'], '20260101');
+      assert.equal(rights[0]?.params['INQR_END_DT'], '20260601');
+      assert.deepEqual(
+        ice.map((call) => call.params['SYMB']),
+        ['SGOV', 'TQQQ'],
+      );
+      assert.equal(ice[0]?.params['NCOD'], 'US');
+      // ICE filters on the announcement date, which runs ahead of the record
+      // date by anything from a day to eleven months, so it is asked for a
+      // year more than the amounts are. Asked for the same range it answers
+      // for one dividend in twelve.
+      assert.equal(ice[0]?.params['ST_YMD'], '20250101', 'a year before the window opens');
+      assert.equal(ice[0]?.params['ED_YMD'], '20260601', 'and no further than it closes');
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('without symbols it sweeps the window once and asks ICE nothing', async () => {
+    const tools = await openTools(DIVIDEND_BODY);
+    try {
+      const data = (await tools.call('overseas_dividends', {}))['result'].structuredContent;
+
+      assert.equal(tools.calls.length, 1, 'one sweep, not one call per ticker in the market');
+      assert.equal(tools.calls[0]?.params['PDNO'], '');
+      assert.equal(tools.calls[0]?.params['INQR_END_DT'], seoulToday());
+      assert.equal(data.dividends.length, 1);
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('the calendar can be turned off', async () => {
+    const tools = await openTools(DIVIDEND_BODY);
+    try {
+      await tools.call('overseas_dividends', { symbols: ['SGOV'], calendar: false });
+      assert.equal(
+        tools.calls.filter((call) => call.endpoint.path.endsWith('/rights-by-ice')).length,
+        0,
+      );
+    } finally {
+      await tools.close();
+    }
+  });
+});
+
+describe('the dividend calendar is not a clean feed', () => {
+  const MESSY = {
+    rt_cd: '0',
+    output: [
+      {
+        pdno: 'TQQQ',
+        prdt_name: 'PROSHARES TRUST ULTRAPRO QQQ USD',
+        bass_dt: '20260326',
+        acpl_bass_dt: '20260325',
+        crcy_cd: 'USD',
+        alct_frcr_unpr: '0.07162',
+        dfnt_yn: 'Y',
+      },
+    ],
+    output1: [
+      // Matches the row above.
+      { ca_title: '현금배당', anno_dt: '20260120', record_dt: '20260325', div_lock_dt: '20260325', pay_dt: '20260331' },
+      // Not a dividend at all.
+      { ca_title: '주식분할', anno_dt: '20251105', record_dt: '20301118', div_lock_dt: '', pay_dt: '' },
+      // Known to the month only, with no record date set yet.
+      { ca_title: '현금배당', anno_dt: '20251117', record_dt: '', div_lock_dt: '20301200', pay_dt: '20310100' },
+      // A real upcoming dividend.
+      { ca_title: '현금배당', anno_dt: '20260120', record_dt: '20301223', div_lock_dt: '20301223', pay_dt: '20301230' },
+      // Announced inside the widened calendar window but settled long before
+      // the window the amounts were asked for.
+      { ca_title: '현금배당', anno_dt: '20240101', record_dt: '20240115', div_lock_dt: '20240115', pay_dt: '20240120' },
+    ],
+  };
+
+  test('a stock split is not returned as a scheduled dividend', async () => {
+    const tools = await openTools(MESSY);
+    try {
+      const data = (await tools.call('overseas_dividends', { symbols: ['TQQQ'] }))['result'].structuredContent;
+      const events = data.symbols[0].scheduled.map((event: Record<string, any>) => event.event);
+
+      assert.equal(events.includes('주식분할'), false, 'ICE files splits and mergers in the same list');
+      assert.ok(events.every((event: string) => event === '현금배당'));
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('a date ICE knows only to the month is marked, not passed off as a date', async () => {
+    const tools = await openTools(MESSY);
+    try {
+      const data = (await tools.call('overseas_dividends', { symbols: ['TQQQ'] }))['result'].structuredContent;
+      const placeholder = data.symbols[0].scheduled.find((event: Record<string, any>) => event.payDate === '20310100');
+
+      // 20310100 is not a date. Parsed it is either invalid or silently
+      // December, so the row says so rather than reading as a schedule.
+      assert.ok(placeholder, 'a dividend expected but not yet scheduled is still worth returning');
+      assert.equal(placeholder.approximate, true);
+      assert.equal(placeholder.recordDate, '');
+
+      const real = data.symbols[0].scheduled.find((event: Record<string, any>) => event.payDate === '20301230');
+      assert.equal(real.approximate, undefined, 'a real schedule is not flagged');
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('an event that predates the window is dropped rather than called scheduled', async () => {
+    const tools = await openTools(MESSY);
+    try {
+      const held = (await tools.call('overseas_dividends', {
+        symbols: ['TQQQ'],
+        startDate: '20250101',
+        endDate: '20260601',
+      }))['result'].structuredContent.symbols[0];
+
+      for (const list of [held.scheduled, held.unpriced]) {
+        assert.equal(
+          list.some((event: Record<string, any>) => event.recordDate === '20240115'),
+          false,
+          'it is only there because the calendar window was widened to catch announcements',
+        );
+      }
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('a dividend ICE reports inside the window with no amount is surfaced, not dropped', async () => {
+    // The two feeds disagree: ICE reports SOXL dividends in March and June
+    // that the rights list has no row for. Dropping them understates a year.
+    const tools = await openTools({
+      rt_cd: '0',
+      output: [],
+      output1: [
+        { ca_title: '현금배당', anno_dt: '20260126', record_dt: '20260324', div_lock_dt: '20260324', pay_dt: '20260331' },
+      ],
+    });
+    try {
+      const held = (await tools.call('overseas_dividends', {
+        symbols: ['SOXL'],
+        startDate: '20260101',
+        endDate: '20260601',
+      }))['result'].structuredContent.symbols[0];
+
+      assert.equal(held.dividends.length, 0);
+      assert.equal(held.unpriced.length, 1);
+      assert.equal(held.unpriced[0].payDate, '20260331');
+      assert.equal(held.scheduled.length, 0, 'it is past, not upcoming');
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('a placeholder whose month has passed is a superseded draft, not a schedule', async () => {
+    const tools = await openTools({
+      rt_cd: '0',
+      output: [],
+      output1: [
+        // Points at a month already gone by: the real schedule has since
+        // been published and is listed in its own right.
+        { ca_title: '현금배당', anno_dt: '20251209', record_dt: '', div_lock_dt: '20251200', pay_dt: '20251200' },
+        // Still ahead.
+        { ca_title: '현금배당', anno_dt: '20260901', record_dt: '', div_lock_dt: '20261200', pay_dt: '20261200' },
+      ],
+    });
+    try {
+      const held = (await tools.call('overseas_dividends', {
+        symbols: ['SOXL'],
+        startDate: '20260101',
+        endDate: '20260601',
+      }))['result'].structuredContent.symbols[0];
+
+      assert.deepEqual(
+        held.scheduled.map((event: Record<string, any>) => event.payDate),
+        ['20261200'],
+      );
+    } finally {
+      await tools.close();
+    }
   });
 });
