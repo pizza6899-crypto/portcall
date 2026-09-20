@@ -68,14 +68,18 @@ const httpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) 
         }),
   });
 
-  // Liveness only. When a secret prefix is configured this is the public face,
-  // so it must not disclose where anything is mounted.
+  // Liveness stays open so probes need no credential. The mount listing does
+  // not: it names every plugin served here, which is reconnaissance for
+  // anyone who found the hostname. It goes only to callers who could already
+  // reach those mounts — and, when a secret prefix is configured, only from
+  // behind it.
   if (pathname === healthRoute || pathname === '/healthz') {
+    const mayListMounts = pathname === healthRoute && isAuthorized(req.headers.authorization, config.token);
     json(res, 200, {
       status: 'ok',
       uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
       authRequired: config.token !== undefined,
-      ...(pathname === healthRoute
+      ...(mayListMounts
         ? { mounts: [...routes.entries()].map(([route, { plugin }]) => ({ route, plugin: plugin.name })) }
         : {}),
     });

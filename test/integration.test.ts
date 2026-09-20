@@ -111,6 +111,26 @@ describe('bearer authentication', () => {
     assert.equal(res.status, 200);
   });
 
+  test('the mount listing is withheld from an unauthenticated caller', async () => {
+    // Liveness is public; what is served here is not. Without this, anyone who
+    // found the hostname could enumerate the plugins behind it.
+    const body = (await (await fetch(`${server.baseUrl}/healthz`)).json()) as Record<string, unknown>;
+    assert.equal(body.status, 'ok');
+    assert.equal('mounts' in body, false);
+  });
+
+  test('the mount listing is served to a caller holding the token', async () => {
+    const res = await fetch(`${server.baseUrl}/healthz`, { headers: { authorization: `Bearer ${token}` } });
+    const body = (await res.json()) as { mounts: { route: string }[] };
+    assert.ok(body.mounts.length > 0, 'a caller who can reach the mounts may list them');
+  });
+
+  test('a wrong token does not reveal the mount listing either', async () => {
+    const res = await fetch(`${server.baseUrl}/healthz`, { headers: { authorization: 'Bearer wrong-token-value' } });
+    const body = (await res.json()) as Record<string, unknown>;
+    assert.equal('mounts' in body, false);
+  });
+
   test('a request without a token is refused', async () => {
     const res = await modernRequest(server.baseUrl, '/vault/mcp', 'tools/list');
     assert.equal(res.status, 401);
