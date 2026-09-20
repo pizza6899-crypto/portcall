@@ -118,6 +118,12 @@ before(async () => {
   await writeFile(join(vault, '노트', '한글 노트.md'), '# 한글\n\n첫 줄\n둘째 줄\n셋째 줄\n넷째 줄\n다섯째 줄\n여섯째 줄\n');
   // NUL bytes make git call it binary, which is what an attachment is.
   await writeFile(join(vault, 'attachments', 'shot.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02]));
+  // Obsidian's own files, which git tracks and a reader does not think of as notes.
+  await mkdir(join(vault, '.obsidian'), { recursive: true });
+  await mkdir(join(vault, '.trash'), { recursive: true });
+  await writeFile(join(vault, '.obsidian', 'app.json'), '{"promptDelete":false}\n');
+  await writeFile(join(vault, '.trash', '버린것.md'), '# 버린것\n');
+  await writeFile(join(vault, '.gitignore'), '.obsidian/workspace.json\n');
   await snapshot('2026-09-05T10:00:00+09:00', 'snapshot 2026-09-05 10:00 — 2 file(s)');
 
   await writeFile(
@@ -196,6 +202,27 @@ describe('vault_changes', () => {
     );
     assert.equal(data.attachments[0].path, 'attachments/shot.png');
     assert.equal(data.attachments[0].added, undefined, 'a binary file has no lines to count');
+  });
+
+  test('keeps Obsidian\'s own files out of the note count', async () => {
+    const { data } = await harness.call('vault_changes', { since: '2026-09-02' });
+    const notes = data.notes.map((note: { path: string }) => note.path);
+    for (const path of ['.obsidian/app.json', '.trash/버린것.md', '.gitignore']) {
+      assert.ok(!notes.includes(path), `${path} is not a note`);
+    }
+    assert.equal(data.noteCount, data.notes.length);
+  });
+
+  test('still reports them, in their own bucket', async () => {
+    // Silently dropping them would tell someone who toggled a plugin that
+    // nothing changed, which is worse than a row they can ignore.
+    const { text, data } = await harness.call('vault_changes', { since: '2026-09-02' });
+    assert.equal(data.configCount, 3);
+    assert.deepEqual(
+      data.config.map((row: { path: string }) => row.path).sort(),
+      ['.gitignore', '.obsidian/app.json', '.trash/버린것.md'],
+    );
+    assert.match(text, /plus 3 setting files/);
   });
 
   test('sorts by when each note was last touched', async () => {

@@ -176,7 +176,12 @@ The vault is a git repository with a job snapshotting it on a timer, and
 mcpvault only ever sees the working tree. Four tools read what is behind it:
 
 - `vault_changes` summarises a window: one row per note, with how much was
-  added and removed and when it was last touched, newest first.
+  added and removed and when it was last touched, newest first. Attachments
+  and Obsidian's own files — `.obsidian/`, `.trash/`, a dotfile at the root —
+  are counted in their own buckets rather than among the notes. They are still
+  reported: someone who toggled a plugin should not be told nothing happened.
+  What is and is not vault content is decided by `paths.ts`, the same list the
+  image tools walk with, so the two cannot come to disagree about it.
 - `note_history` lists the snapshots that touched one note, follows it through
   renames, and finds notes that are no longer in the vault.
 - `note_diff` returns the lines that changed between two points.

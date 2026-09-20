@@ -6,7 +6,7 @@ import { z } from 'zod';
 
 import { isImagePath } from './media.js';
 import type { ExtraTool, ToolResult } from './merge.js';
-import { insideVault, resolveTarget } from './paths.js';
+import { insideVault, isVaultContent, resolveTarget } from './paths.js';
 
 const run = promisify(execFile);
 
@@ -398,6 +398,7 @@ function vaultChangesTool(options: HistoryToolOptions): ExtraTool<z.infer<typeof
 
       const notes: Record<string, unknown>[] = [];
       const attachments: Record<string, unknown>[] = [];
+      const config: Record<string, unknown>[] = [];
       for (const change of parseRaw(diff)) {
         const at = touched.get(change.path) ?? (change.from === undefined ? undefined : touched.get(change.from));
         const row: Record<string, unknown> = {
@@ -406,7 +407,13 @@ function vaultChangesTool(options: HistoryToolOptions): ExtraTool<z.infer<typeof
           ...(change.from === undefined ? {} : { from: change.from }),
           ...(at === undefined ? {} : { lastChanged: at }),
         };
-        if (isImagePath(change.path)) {
+        if (!isVaultContent(change.path)) {
+          // Obsidian's own settings, its recycle bin, a dotfile at the root.
+          // Changed, and worth saying so — someone who toggled a plugin should
+          // not be told nothing happened — but not what "what did I write this
+          // week" is asking about.
+          config.push(row);
+        } else if (isImagePath(change.path)) {
           // An attachment has no lines to count, and a screenshot sitting in
           // the middle of a list of notes is what makes the list unreadable.
           attachments.push(row);
@@ -420,16 +427,20 @@ function vaultChangesTool(options: HistoryToolOptions): ExtraTool<z.infer<typeof
         String(b['lastChanged'] ?? '').localeCompare(String(a['lastChanged'] ?? ''));
       notes.sort(byTime);
       attachments.sort(byTime);
+      config.sort(byTime);
 
       const counted = `${notes.length} note${notes.length === 1 ? '' : 's'}`;
       const withFiles = attachments.length === 0 ? '' : ` and ${attachments.length} attachment${attachments.length === 1 ? '' : 's'}`;
-      return result(`${counted}${withFiles} changed between ${from.label} and ${to.label}.`, {
+      const withConfig = config.length === 0 ? '' : `, plus ${config.length} setting file${config.length === 1 ? '' : 's'}`;
+      return result(`${counted}${withFiles} changed between ${from.label} and ${to.label}${withConfig}.`, {
         window,
         noteCount: notes.length,
         attachmentCount: attachments.length,
+        configCount: config.length,
         notes: notes.slice(0, limit),
         attachments: attachments.slice(0, limit),
-        ...(notes.length > limit || attachments.length > limit ? { truncated: true } : {}),
+        config: config.slice(0, limit),
+        ...(notes.length > limit || attachments.length > limit || config.length > limit ? { truncated: true } : {}),
       });
     },
   };

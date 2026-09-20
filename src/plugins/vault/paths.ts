@@ -2,10 +2,11 @@ import { readdir } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 
 /**
- * Directories that hold no user attachments.
+ * Directories that hold nothing the vault is for.
  *
- * `.obsidian` is configuration, `.trash` is Obsidian's own recycle bin, and a
- * file in either would show up as an orphan every time.
+ * `.obsidian` is configuration, `.trash` is Obsidian's own recycle bin. A file
+ * in either would show up as an orphan every time it was listed, and as a note
+ * every time one was counted.
  */
 const SKIPPED_DIRECTORIES = new Set(['.git', '.obsidian', '.trash', 'node_modules']);
 
@@ -23,6 +24,21 @@ export function insideVault(vaultPath: string, candidate: string): string {
     throw new Error(`Path escapes the vault: ${candidate}`);
   }
   return full;
+}
+
+/**
+ * Whether a vault-relative path is the kind of file the vault is for.
+ *
+ * `walkVault` prunes the same two things as it descends — a directory on the
+ * list above, and a dotfile — but a path that arrives as a string, from git
+ * rather than from a traversal, has nothing to prune. Both read that one list
+ * so the image tools and the history tools cannot come to disagree about what
+ * counts as a note.
+ */
+export function isVaultContent(path: string): boolean {
+  const segments = path.split('/');
+  if ((segments[segments.length - 1] ?? '').startsWith('.')) return false;
+  return !segments.slice(0, -1).some((segment) => SKIPPED_DIRECTORIES.has(segment));
 }
 
 /** Every file in the vault, as paths relative to its root, in directory order. */
