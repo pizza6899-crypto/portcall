@@ -86,7 +86,7 @@ its owner.
 
 | Mount | Serves |
 |---|---|
-| `/vault/mcp` | `@bitbonsai/mcpvault` over the Obsidian vault at `PORTCALL_VAULT_PATH`, plus image tools |
+| `/vault/mcp` | `@bitbonsai/mcpvault` over the Obsidian vault at `PORTCALL_VAULT_PATH`, plus image and history tools |
 | `/kis/mcp` | Korea Investment & Securities overseas-stock quotations, read-only |
 
 ### Vault images
@@ -169,6 +169,63 @@ the result still will not fit, the longest edge is halved, twice.
 
 A read-only mount serves `read_image` and `find_images`, and withholds
 `write_image` and `delete_image`.
+
+### Vault history
+
+The vault is a git repository with a job snapshotting it on a timer, and
+mcpvault only ever sees the working tree. Four tools read what is behind it:
+
+- `vault_changes` summarises a window: one row per note, with how much was
+  added and removed and when it was last touched, newest first.
+- `note_history` lists the snapshots that touched one note, follows it through
+  renames, and finds notes that are no longer in the vault.
+- `note_diff` returns the lines that changed between two points.
+- `note_at` returns a note as it stood. This is also how one is recovered —
+  read it here, write it back with mcpvault's `write_note` — which is why
+  there is no restore tool. A recovery is then an ordinary edit, visible in
+  the next snapshot like any other.
+
+A vault that is not a git repository gets none of these, the way the KIS mount
+serves quotations only until an account is configured. A listed tool that
+always fails is worse than one that was never listed.
+
+#### Why a window is not a list of commits
+
+Snapshots are taken on a timer, so a commit boundary is where the clock fell
+rather than where a thought ended. One sitting is scattered across several
+commits, each titled `snapshot <time>`, and listing them shows the same note
+four times while saying nothing about it. `vault_changes` compares the two
+ends of the window instead, and `note_history` is what answers at commit
+resolution — which is the question a commit boundary is actually good for
+(*when did that paragraph go*).
+
+#### Three things that would otherwise be quietly wrong
+
+- **A Korean path comes back escaped.** By default git prints anything
+  outside ASCII as `"\355\225\234..."`, which then matches no file in the
+  vault. Every call sets `core.quotePath=false`.
+- **git does not reject a date it cannot read.** `--before=<value>` falls back
+  to the current time, so a typo would be answered with *nothing changed*
+  rather than with the typo — the worst shape an error can take. The value
+  goes through `rev-parse --since` first and one that comes back as now is
+  refused, which is what happens to `지난주` or `yesterdya`. What cannot be
+  caught is a near miss git half-understands: `last tuseday` quietly becomes a
+  real date. So the moment a date resolved to is reported in the answer, where
+  a wrong reading is at least visible.
+- **A note renamed after the window closed.** Inside that window the note only
+  ever had its old name, so asking by the name it has today would report no
+  change across its entire earlier life — and disagree with `note_history`,
+  which does follow renames. The diff is taken against every name the note has
+  had.
+
+`GIT_OPTIONAL_LOCKS=0` is set on every call so that a read never takes the
+index lock: the snapshot job commits on a timer, and a model asking what
+changed should not be why that fails.
+
+A rename combined with a heavy rewrite falls below git's 50% similarity
+threshold and reads as a delete and an add. That is left at git's default
+rather than loosened — a vault of notes started from the same template would
+otherwise start reporting renames between unrelated ones.
 
 ### KIS
 
@@ -408,10 +465,11 @@ src/
   adapters/
     inProcess.ts       library-factory adapter
   plugins/
-    vault/             mcpvault plus image tools
+    vault/             mcpvault plus image and history tools
       index.ts         plugin factory
       merge.ts         fronts mcpvault so extra tools share the mount
       image.ts         read_image, find_images, write_image, delete_image
+      git.ts           vault_changes, note_history, note_diff, note_at
       media.ts         format sniffing, header dimensions, sips re-encoding
       paths.ts         vault confinement, walking, embed/frontmatter/canvas refs
     kis/               Korea Investment quotations (read-only)
@@ -434,6 +492,8 @@ test/
                        extension aliases, the private-address filter, download caps
   vault-image.test.ts  the image tools, driven through the merged server,
                        plus what survives an upstream that goes away
+  vault-git.test.ts    the history tools against a fixture repository:
+                       Korean paths, unreadable dates, renames, deleted notes
   helpers.ts           server harness and MCP request builders
 ```
 

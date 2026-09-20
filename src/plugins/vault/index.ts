@@ -2,6 +2,7 @@ import { createServer } from '@bitbonsai/mcpvault';
 
 import { inProcess } from '../../adapters/inProcess.js';
 import type { Plugin } from '../../types.js';
+import { historyTools } from './git.js';
 import { imageTools } from './image.js';
 import { mergeTools } from './merge.js';
 
@@ -20,17 +21,20 @@ export interface VaultPluginOptions {
 }
 
 /**
- * mcpvault plus this project's image tools, served in-process on one mount.
+ * mcpvault plus this project's image and history tools, served in-process
+ * on one mount.
  *
  * mcpvault reads and writes notes but has nothing for attachments, so an
  * embedded screenshot reaches a model as the literal text `![[shot.png]]`.
- * The image tools fill that in. They are merged into mcpvault's listing
- * rather than mounted separately so the vault stays one connector.
+ * The image tools fill that in, and the history tools answer from the vault's
+ * own git repository — what changed this week, what a note said before an
+ * edit. Both are merged into mcpvault's listing rather than mounted
+ * separately so the vault stays one connector.
  */
 export function vaultPlugin(options: VaultPluginOptions): Plugin {
   const { vaultPath, path = 'vault', readOnly = false, importRoots = [] } = options;
   const name = `mcpvault(${path})`;
-  const extras = imageTools({ vaultPath, readOnly, importRoots });
+  const extras = [...imageTools({ vaultPath, readOnly, importRoots }), ...historyTools({ vaultPath })];
 
   return {
     name,
