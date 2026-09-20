@@ -174,9 +174,10 @@ A read-only mount serves `read_image` and `find_images`, and withholds
 
 Quotation tools, which need no account: `overseas_quote`,
 `overseas_quote_detail`, `overseas_daily_prices`, `overseas_orderbook` (ten
-levels a side, with the session summary), `fx_rate` (exchange rate
-history for 14 currencies against the dollar) and `overseas_index` (Dow,
-Nasdaq Composite, Nasdaq 100, S&P 500).
+levels a side, with the session summary), `overseas_history` (long cached
+series as CSV), `fx_rate` (exchange rate history for 14 currencies against
+the dollar) and `overseas_index` (Dow, Nasdaq Composite, Nasdaq 100,
+S&P 500).
 
 Account tools, registered only when `KIS_ACCOUNT` is set: `overseas_balance`
 (the whole account in one call — every position, cash and margin per
@@ -207,6 +208,40 @@ into a single request.
 Account queries are paged: KIS signals more rows with `tr_cont` of `F` or `M`
 and expects the next request to echo the cursor from the previous body. The
 client walks that automatically, up to a page ceiling.
+
+`overseas_history` exists because backtesting wants more bars than a quote
+tool should hand back. Nineteen years of daily bars is 4,801 of them, which
+is forty-nine round trips at a hundred a page — tolerable once, absurd on
+every request, and the answer never changes: a bar from 2014 is settled. So
+the series is assembled once into `~/.cache/portcall/history/`, and after
+that only its tail is refreshed.
+
+Three things follow from that, and each is a thing that would otherwise be
+quietly wrong:
+
+- **A split rewrites history.** Adjusted prices are restated all the way
+  back, and the leveraged ETFs this exists for split often. Every request
+  re-reads the newest page anyway; comparing it against what is stored turns
+  that call into the staleness check, and a disagreement throws the series
+  away rather than serving a wrong one.
+- **A long gap leaves a hole.** Unused for more than a hundred sessions and
+  the newest page no longer touches what is stored. The walk closes the gap
+  before the two halves are joined, so the series is never discontinuous.
+- **The wrong venue looks like no data.** SOXL lists on `AMS` while SOXX,
+  TQQQ and QQQM list on `NAS`, and asking the wrong one returns an empty page
+  rather than an error. `exchange` can therefore be left out: the US venues
+  are tried in turn and the answer is remembered.
+
+Bars come back as CSV — `date,open,high,low,close,volume`, oldest first —
+rather than as a JSON object per bar. The quote tools return fourteen fields
+including a bid/ask snapshot that means nothing on a daily bar; dropping the
+nine a price series cannot use takes a bar from 284 bytes to 65. Nineteen
+years is 231 kB instead of 1.3 MB. Weekly is 48 kB and monthly 11 kB, so a
+whole span costs almost nothing at those sizes. A call is capped at 1,200
+bars by default and says when it clipped.
+
+History begins 2007-08-20 on this endpoint whatever the listing date —
+checked against several symbols, including ones listed decades earlier.
 
 The chart endpoint behind `fx_rate` and `overseas_index` has no such cursor,
 and caps a call at 100 rows without saying so: a request for three years of
@@ -382,6 +417,7 @@ src/
     kis/               Korea Investment quotations (read-only)
       index.ts         plugin factory, process-lifetime token store and client
       client.ts        quotation allowlist, headers, throttle, error mapping
+      history.ts       cached long price series, paging, split detection
       token.ts         access-token cache (memory + disk)
       tools.ts         the quotation tools
 plugins.config.ts      which plugins mount at which paths
@@ -392,7 +428,8 @@ test/
   kis-token.test.ts    token caching, single-flight, restart reload
   kis-client.test.ts   allowlist, headers, paging, KIS error surfacing
   kis-tools.test.ts    the tool set, read-only hints, Korean business dates,
-                       the order book ladder, chart-range coverage
+                       the order book ladder, chart-range coverage, CSV history
+  kis-history.test.ts  paging, the disk cache, split detection, venue lookup
   vault-media.test.ts  header parsing, format sniffing, reference extraction,
                        extension aliases, the private-address filter, download caps
   vault-image.test.ts  the image tools, driven through the merged server,

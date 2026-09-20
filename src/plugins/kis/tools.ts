@@ -2,6 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 
 import { ENDPOINTS, type KisClient } from './client.js';
+import { COLUMNS, HISTORY_FLOOR, type HistoryStore, type Period } from './history.js';
 
 /**
  * Read-only tools over KIS.
@@ -820,6 +821,87 @@ function registerQuotationTools(server: McpServer, client: KisClient): void {
   );
 }
 
+/** Bars returned in one call unless the caller asks for more. */
+const DEFAULT_HISTORY_BARS = 1200;
+
+/** Hard ceiling. Nineteen years of daily bars is about 4,800. */
+const MAX_HISTORY_BARS = 5000;
+
+function registerHistoryTool(server: McpServer, history: HistoryStore): void {
+  server.registerTool(
+    'overseas_history',
+    {
+      title: 'Overseas price history',
+      description:
+        'A long price series for one overseas-listed stock or ETF, as CSV — for backtesting and anything else that needs more than a screenful of bars. KIS serves 100 bars a call with no cursor, so the series is assembled once, cached on disk and afterwards only extended, which makes a repeat request nearly free. `exchange` can be left out and the US venues are tried in turn: SOXL lists on AMS while SOXX, TQQQ and QQQM list on NAS, and the wrong one returns nothing rather than an error. History begins 2007-08-20 whatever the listing date. Bars are oldest first. For a whole span at low cost use `period` week or month; daily is capped per call and says when it clipped.',
+      inputSchema: z.object({
+        symbol,
+        exchange: quoteExchange.optional().describe('Leave out to look the symbol up across the US venues.'),
+        period: z.enum(['day', 'week', 'month']).default('day').describe('Bar size'),
+        startDate: yyyymmdd.optional().describe(`First date, YYYYMMDD. Defaults to everything, back to ${HISTORY_FLOOR}.`),
+        endDate: yyyymmdd.optional().describe('Last date, YYYYMMDD. Defaults to the most recent session.'),
+        maxBars: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_HISTORY_BARS)
+          .optional()
+          .describe(`Most bars to return, newest kept. Defaults to ${DEFAULT_HISTORY_BARS}.`),
+      }),
+      annotations: READ_ONLY,
+    },
+    async ({ symbol: symb, exchange, period, startDate, endDate, maxBars = DEFAULT_HISTORY_BARS }) => {
+      const series = await history.get({
+        symbol: symb,
+        ...(exchange === undefined ? {} : { exchange }),
+        period: period as Period,
+        ...(startDate === undefined ? {} : { startDate }),
+        ...(endDate === undefined ? {} : { endDate }),
+      });
+
+      const clipped = series.bars.length > maxBars;
+      const rows = clipped ? series.bars.slice(-maxBars) : series.bars;
+
+      const data: Record<string, unknown> = {
+        symbol: series.symbol,
+        exchange: series.exchange,
+        period,
+        columns: COLUMNS,
+        count: rows.length,
+        from: rows[0]?.[0],
+        to: rows.at(-1)?.[0],
+        truncated: clipped,
+        ...(clipped ? { matched: series.bars.length } : {}),
+        cachedFrom: series.cachedFrom,
+        cachedTo: series.cachedTo,
+        reachesFloor: series.complete,
+        apiCalls: series.fetched,
+      };
+
+      const clip = clipped
+        ? ` — clipped from ${series.bars.length} to the newest ${rows.length}; raise maxBars, narrow the range, or use a larger period.`
+        : '';
+      const source = series.fetched === 0 ? 'from cache' : `${series.fetched} call${series.fetched === 1 ? '' : 's'} to KIS`;
+
+      // The CSV goes in the text block only. `result` renders the structured
+      // payload into that same block, so carrying the bars in both would put
+      // every byte on the wire twice.
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text:
+              `${series.symbol} on ${series.exchange}: ${rows.length} ${period} bars, ` +
+              `${String(rows[0]?.[0] ?? '-')}–${String(rows.at(-1)?.[0] ?? '-')} (${source})${clip}\n\n` +
+              `${COLUMNS}\n${rows.map((bar) => bar.join(',')).join('\n')}`,
+          },
+        ],
+        structuredContent: data,
+      };
+    },
+  );
+}
+
 function registerAccountTools(server: McpServer, client: KisClient, account: KisAccount): void {
   const identity = { CANO: account.cano, ACNT_PRDT_CD: account.productCode };
 
@@ -982,7 +1064,13 @@ function registerAccountTools(server: McpServer, client: KisClient, account: Kis
 }
 
 /** Register every tool the configuration allows. */
-export function registerTools(server: McpServer, client: KisClient, account?: KisAccount): void {
+export function registerTools(
+  server: McpServer,
+  client: KisClient,
+  account?: KisAccount,
+  history?: HistoryStore,
+): void {
   registerQuotationTools(server, client);
+  if (history !== undefined) registerHistoryTool(server, history);
   if (account !== undefined) registerAccountTools(server, client, account);
 }

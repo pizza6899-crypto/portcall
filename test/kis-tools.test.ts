@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { InMemoryTransport, McpServer } from '@modelcontextprotocol/server';
 
 import type { Endpoint, KisClient } from '../src/plugins/kis/client.js';
+import type { Bar, HistoryStore } from '../src/plugins/kis/history.js';
 import { registerTools } from '../src/plugins/kis/tools.js';
 
 interface Call {
@@ -277,6 +278,122 @@ describe('a chart range KIS will not serve in full', () => {
         .structuredContent;
       assert.equal(data.truncated, true);
       assert.equal(data.covered.from, '20260611');
+    } finally {
+      await tools.close();
+    }
+  });
+});
+
+describe('the history tool', () => {
+  /** A store that answers from a fixed series, so only the rendering is under test. */
+  function stubHistory(count: number): HistoryStore {
+    const bars: Bar[] = [...Array(count)].map((_, i) => {
+      const day = new Date(Date.UTC(2010, 0, 4) + i * 86_400_000).toISOString().slice(0, 10).replaceAll('-', '');
+      return [day, '10.00', '11.00', '9.00', String(10 + i) + '.00', '1000'];
+    });
+    return {
+      get: async () => ({
+        symbol: 'SOXL',
+        exchange: 'AMS',
+        period: 'day',
+        bars,
+        cachedFrom: bars[0]![0],
+        cachedTo: bars.at(-1)![0],
+        complete: true,
+        fetched: 0,
+      }),
+    };
+  }
+
+  async function openWithHistory(count: number) {
+    const client: KisClient = { get: async () => ({}), getAll: async () => [] };
+    const server = new McpServer({ name: 'kis-test', version: '0' });
+    registerTools(server, client, undefined, stubHistory(count));
+
+    const [near, far] = InMemoryTransport.createLinkedPair();
+    const pending = new Map<number, (message: Record<string, any>) => void>();
+    near.onmessage = (message: any) => {
+      const settle = pending.get(message.id);
+      if (settle !== undefined) {
+        pending.delete(message.id);
+        settle(message);
+      }
+    };
+    await server.connect(far);
+    await near.start();
+
+    let id = 0;
+    const rpc = (method: string, params: Record<string, unknown>): Promise<Record<string, any>> =>
+      new Promise((resolve) => {
+        id += 1;
+        pending.set(id, resolve);
+        void near.send({ jsonrpc: '2.0', id, method, params } as any);
+      });
+    await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } });
+    await near.send({ jsonrpc: '2.0', method: 'notifications/initialized' } as any);
+
+    return {
+      call: (args: Record<string, unknown>) => rpc('tools/call', { name: 'overseas_history', arguments: args }),
+      close: async () => {
+        await near.close();
+        await server.close();
+      },
+    };
+  }
+
+  test('bars come back as CSV, not as a JSON object per bar', async () => {
+    // Fourteen fields of JSON per bar is 284 bytes; six columns of CSV is 65.
+    // Over four thousand bars that is the difference between 1.3 MB and 300 kB.
+    const tools = await openWithHistory(5);
+    try {
+      const text = (await tools.call({ symbol: 'SOXL' }))['result'].content[0].text as string;
+      const lines = text.split('\n');
+      assert.equal(lines[2], 'date,open,high,low,close,volume', 'a header row names the columns');
+      assert.equal(lines[3], '20100104,10.00,11.00,9.00,10.00,1000');
+      assert.equal(lines.length, 3 + 5, 'one line per bar, nothing else');
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('the bars are not also repeated in the structured payload', async () => {
+    // `result` renders structuredContent into the same text block, so carrying
+    // the series in both would put every byte on the wire twice.
+    const tools = await openWithHistory(5);
+    try {
+      const data = (await tools.call({ symbol: 'SOXL' }))['result'].structuredContent;
+      assert.equal('bars' in data, false);
+      assert.equal(data.count, 5);
+      assert.equal(data.columns, 'date,open,high,low,close,volume');
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('more bars than asked for are clipped to the newest, and said so', async () => {
+    const tools = await openWithHistory(300);
+    try {
+      const response = await tools.call({ symbol: 'SOXL', maxBars: 100 });
+      const data = response['result'].structuredContent;
+      assert.equal(data.truncated, true);
+      assert.equal(data.count, 100);
+      assert.equal(data.matched, 300, 'and how many there really were');
+      assert.equal(data.cachedFrom, '20100104', 'the cache still holds the rest');
+      assert.match(response['result'].content[0].text as string, /clipped from 300 to the newest 100/);
+
+      const lines = (response['result'].content[0].text as string).split('\n');
+      assert.equal(lines.at(-1)!.startsWith(data.to), true, 'the newest bar is the last line');
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('a series that fits is not flagged', async () => {
+    const tools = await openWithHistory(50);
+    try {
+      const data = (await tools.call({ symbol: 'SOXL' }))['result'].structuredContent;
+      assert.equal(data.truncated, false);
+      assert.equal('matched' in data, false);
     } finally {
       await tools.close();
     }
