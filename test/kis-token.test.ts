@@ -1,8 +1,8 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { createTokenStore } from '../src/plugins/kis/token.js';
 
@@ -140,5 +140,35 @@ describe('KIS token store', () => {
 
     await assert.rejects(() => store.get());
     assert.equal(await store.get(), 'recovered');
+  });
+
+  test('the cache is replaced in one step, leaving nothing half-written', async () => {
+    const cachePath = await cacheFile();
+    const kis = issuing();
+
+    await createTokenStore({ baseUrl: BASE, appKey: 'key', appSecret: 'secret', cachePath, fetchImpl: kis.fetchImpl }).get();
+
+    // A truncated file reads back as no cache and costs an issue, so the
+    // write goes to a sibling and is moved into place.
+    const written = JSON.parse(await readFile(cachePath, 'utf8'));
+    assert.equal(written.value, 'token-1');
+    assert.deepEqual(
+      (await readdir(dirname(cachePath))).filter((name) => name.endsWith('.tmp')),
+      [],
+      'no temporary file is left behind',
+    );
+  });
+
+  test('a cache that already exists is still left readable only by its owner', async () => {
+    const cachePath = await cacheFile();
+    await writeFile(cachePath, '{}');
+    await chmod(cachePath, 0o644);
+
+    const kis = issuing();
+    await createTokenStore({ baseUrl: BASE, appKey: 'key', appSecret: 'secret', cachePath, fetchImpl: kis.fetchImpl }).get();
+
+    // `writeFile`'s mode applies only when it creates the file, so rewriting
+    // in place would have kept 0644.
+    assert.equal((await stat(cachePath)).mode & 0o777, 0o600);
   });
 });

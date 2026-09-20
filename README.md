@@ -282,6 +282,11 @@ server enforces both:
   `/<prefix>/healthz`. The bare `/healthz` still answers, so liveness probes
   keep working, but it discloses no paths.
 
+The authenticated health payload also reports `blockedClients`, the number of
+clients the guard is currently holding off. It sits behind the same gate as
+the mount list: it is for whoever runs this, and it would otherwise tell a
+caller whether their guessing had been noticed.
+
 Treat a path prefix as weaker than a header. URLs reach proxy access logs,
 crash reports, and anything that records a destination, and a leaked one grants
 the same access a leaked token would. It raises the bar — it is not
@@ -360,7 +365,8 @@ test/
   routes.test.ts       mount resolution
   auth.test.ts         bearer token check
   kis-token.test.ts    token caching, single-flight, restart reload
-  kis-client.test.ts   allowlist, headers, KIS error surfacing
+  kis-client.test.ts   allowlist, headers, paging, KIS error surfacing
+  kis-tools.test.ts    the tool set, read-only hints, Korean business dates
   vault-media.test.ts  header parsing, format sniffing, reference extraction
   vault-image.test.ts  the image tools, driven through the merged server
   helpers.ts           server harness and MCP request builders

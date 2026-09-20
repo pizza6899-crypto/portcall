@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import { digest, log } from '../../log.js';
@@ -93,10 +93,17 @@ export function createTokenStore(options: TokenStoreOptions): TokenStore {
   async function toDisk(token: KisToken): Promise<void> {
     if (cachePath === undefined) return;
     const body: CacheFile = { appKey: owner, value: token.value, expiresAt: token.expiresAt };
+    // Written beside the target and moved into place: a crash mid-write would
+    // otherwise leave truncated JSON, which reads back as no cache at all and
+    // spends an issue the next start. The rename also means the file is always
+    // created fresh at 0600 rather than keeping whatever mode it had.
+    const pending = `${cachePath}.${process.pid}.tmp`;
     try {
       await mkdir(dirname(cachePath), { recursive: true, mode: 0o700 });
-      await writeFile(cachePath, JSON.stringify(body), { mode: 0o600 });
+      await writeFile(pending, JSON.stringify(body), { mode: 0o600 });
+      await rename(pending, cachePath);
     } catch (error) {
+      await rm(pending, { force: true }).catch(() => undefined);
       // Losing the mirror costs one extra issue after a restart, not correctness.
       log.warn('could not persist KIS token', { error: (error as Error).message });
     }

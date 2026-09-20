@@ -108,7 +108,13 @@ const httpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) 
       uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
       authRequired: config.token !== undefined,
       ...(mayListMounts
-        ? { mounts: [...routes.entries()].map(([route, { plugin }]) => ({ route, plugin: plugin.name })) }
+        ? {
+            mounts: [...routes.entries()].map(([route, { plugin }]) => ({ route, plugin: plugin.name })),
+            // How many clients the guard is currently holding off. Behind the
+            // same gate as the mount list: it is for whoever runs this, and it
+            // would tell a caller whether their guessing had been noticed.
+            blockedClients: guard.blockedCount(now),
+          }
         : {}),
     });
     return;

@@ -394,9 +394,11 @@ const PNL_TOTAL_FIELDS = {
   stck_buy_amt_smtl: 'costTotal',
   smtl_fee1: 'feesTotal',
   excc_dfrm_amt: 'settledAmount',
+  // Two spellings of the same period total. The published sample names only
+  // the first; the live API sends the second, which is how the second was
+  // found. Both map to one name deliberately — only one ever arrives, and if
+  // that ever changes they carry the same figure.
   ovrs_rlzt_pfls_amt: 'realizedPnl',
-  // What the live API actually returns for the period total; the published
-  // sample names only the per-row field, so this was found by calling it.
   ovrs_rlzt_pfls_tot_amt: 'realizedPnl',
   tot_pftrt: 'totalReturnPercent',
   bass_dt: 'baseDate',
@@ -476,8 +478,22 @@ function result(summary: string, data: Record<string, unknown>) {
   };
 }
 
+/**
+ * KIS dates are Korean business dates, so they are worked out in Seoul rather
+ * than wherever this happens to run. The two are not always the same day:
+ * this host sits at UTC+7, two hours behind, so between midnight and 02:00 in
+ * Korea the local date is still yesterday — which is the middle of the US
+ * session, exactly when a default of "today" matters.
+ */
+const SEOUL_DATE = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Asia/Seoul',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
 function stamp(date: Date): string {
-  return `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}`;
+  return SEOUL_DATE.format(date).replaceAll('-', '');
 }
 
 function today(): string {
@@ -485,13 +501,12 @@ function today(): string {
 }
 
 function startOfYear(): string {
-  return `${new Date().getFullYear()}0101`;
+  return `${today().slice(0, 4)}0101`;
 }
 
 function daysAgo(days: number): string {
-  const date = new Date();
-  date.setDate(date.getDate() - days);
-  return stamp(date);
+  // Korea has no daylight saving, so a fixed day length is exact here.
+  return stamp(new Date(Date.now() - days * 24 * 60 * 60 * 1000));
 }
 
 const READ_ONLY = { readOnlyHint: true, openWorldHint: true } as const;

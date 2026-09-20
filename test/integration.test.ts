@@ -428,6 +428,19 @@ describe('a hostile request target', () => {
     assert.deepEqual(await res.json(), { error: 'not_found' });
   });
 
+  test('the operator can see how many clients are blocked', async () => {
+    const authorised = { Authorization: `Bearer ${token}` };
+
+    const open = await fetch(`${server.baseUrl}/healthz`);
+    const anonymous = (await open.json()) as Record<string, unknown>;
+    assert.equal('blockedClients' in anonymous, false, 'a caller is not told whether anyone is blocked');
+
+    const detailed = await fetch(`${server.baseUrl}/healthz`, { headers: authorised });
+    const payload = (await detailed.json()) as Record<string, unknown>;
+    assert.equal(typeof payload['blockedClients'], 'number');
+    assert.ok(Array.isArray(payload['mounts']));
+  });
+
   test('a block cannot be cleared by crashing the process', async () => {
     const guessing = { Authorization: 'Bearer wrong' };
     for (let attempt = 0; attempt < 6; attempt += 1) {
