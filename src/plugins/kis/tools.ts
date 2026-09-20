@@ -134,6 +134,29 @@ const DETAIL_FIELDS = {
   mcap: 'capital',
   tomv: 'marketCap',
   vnit: 'tradingUnit',
+  // The rest of what price-detail carries, confirmed against the live API
+  // rather than the published field list — a call with the wrong `EXCD`
+  // answers 200 with every one of these blank, which is how they look like
+  // fields that are never sent. Asked on the venue the ticker actually
+  // trades on, `etyp_nm` reads "ETF", `e_ordyn` "매매 가능", and the won
+  // conversion is the quote times `t_rate`.
+  etyp_nm: 'etpType',
+  e_ordyn: 'tradable',
+  e_hogau: 'tickSize',
+  e_parp: 'parValue',
+  // Empty on all four ETFs measured. Kept because an individual stock is the
+  // case it would be populated for, and an absent key costs nothing.
+  e_icod: 'sector',
+  t_rate: 'fxRate',
+  p_rate: 'previousFxRate',
+  t_xprc: 'lastInWon',
+  t_xdif: 'changeInWon',
+  t_xrat: 'changePercentInWon',
+  t_xsgn: 'changeSignInWon',
+  p_xprc: 'previousCloseInWon',
+  p_xdif: 'previousChangeInWon',
+  p_xrat: 'previousChangePercentInWon',
+  p_xsng: 'previousChangeSignInWon',
 } as const;
 
 /**
