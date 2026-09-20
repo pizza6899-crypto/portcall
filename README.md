@@ -67,7 +67,8 @@ request, so there is no session state to time out and no accumulating handles.
 ### KIS
 
 Quotation tools, which need no account: `overseas_quote`,
-`overseas_quote_detail`, `overseas_daily_prices`, `overseas_orderbook`.
+`overseas_quote_detail`, `overseas_daily_prices`, `overseas_orderbook` and
+`fx_rate` (exchange rate history for 14 currencies against the dollar).
 
 Account tools, registered only when `KIS_ACCOUNT` is set: `overseas_holdings`
 (positions with cost, market value and unrealised P&L), `overseas_executions`
@@ -96,6 +97,10 @@ into a single request.
 Account queries are paged: KIS signals more rows with `tr_cont` of `F` or `M`
 and expects the next request to echo the cursor from the previous body. The
 client walks that automatically, up to a page ceiling.
+
+Exchange rates are not all quoted the same way round: most pairs are units
+per dollar, but EUR, GBP and AUD are dollars per unit, so `fx_rate` states the
+direction in `quotedAs` rather than leaving it to be inferred.
 
 Values come back as strings, exactly as KIS sends them; `decimals` says how
 many places the venue quotes to. Quotes are delayed unless the account carries

@@ -269,7 +269,7 @@ describe('the KIS plugin', () => {
       // Prices are public; a portfolio is not. Exposing one must not expose the other.
       assert.deepEqual(
         tools.map((t) => t.name).sort(),
-        ['overseas_daily_prices', 'overseas_orderbook', 'overseas_quote', 'overseas_quote_detail'],
+        ['fx_rate', 'overseas_daily_prices', 'overseas_orderbook', 'overseas_quote', 'overseas_quote_detail'],
       );
       // The list above is the whole surface: a tool that could place, amend or
       // cancel an order is not registered, so it cannot be called. Everything
@@ -288,6 +288,7 @@ describe('the KIS plugin', () => {
       const tools = (payload.result as { tools: { name: string; annotations?: { readOnlyHint?: boolean } }[] }).tools;
 
       assert.deepEqual(tools.map((t) => t.name).sort(), [
+        'fx_rate',
         'overseas_daily_prices',
         'overseas_executions',
         'overseas_holdings',

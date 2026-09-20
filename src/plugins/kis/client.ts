@@ -36,6 +36,7 @@ export const ENDPOINTS = {
   priceDetail: { path: '/uapi/overseas-price/v1/quotations/price-detail', trId: 'HHDFS76200200' },
   dailyPrice: { path: '/uapi/overseas-price/v1/quotations/dailyprice', trId: 'HHDFS76240000' },
   askingPrice: { path: '/uapi/overseas-price/v1/quotations/inquire-asking-price', trId: 'HHDFS76200100' },
+  fxRate: { path: '/uapi/overseas-price/v1/quotations/inquire-daily-chartprice', trId: 'FHKST03030100' },
   // Account inquiries — real-money tr_ids; the paper domain uses a `V` prefix.
   holdings: { path: '/uapi/overseas-stock/v1/trading/inquire-balance', trId: 'TTTS3012R' },
   executions: { path: '/uapi/overseas-stock/v1/trading/inquire-ccnl', trId: 'TTTS3035R' },

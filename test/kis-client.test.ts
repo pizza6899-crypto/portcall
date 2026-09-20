@@ -119,6 +119,13 @@ describe('KIS client', () => {
     assert.equal(seen[1]!.url.searchParams.get('CTX_AREA_FK200'), 'FK');
   });
 
+  test('the exchange rate endpoint is a quotation, not an account call', () => {
+    // It shares an endpoint family with the index charts, so it is worth
+    // pinning that it stayed out of the /trading/ namespace.
+    assert.ok(ENDPOINTS.fxRate.path.startsWith('/uapi/overseas-price/v1/quotations/'));
+    assert.equal(ENDPOINTS.fxRate.path.startsWith(TRADING_NAMESPACE), false);
+  });
+
   test('a paged call cannot run away', async () => {
     const { client, seen } = clientAnswering({ rt_cd: '0', output: [] }, 200, Array(50).fill('M'));
 

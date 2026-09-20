@@ -154,6 +154,55 @@ const DAILY_ROW_FIELDS = {
   vask: 'askSize',
 } as const;
 
+/**
+ * Currency pairs KIS quotes, with the direction each one is quoted in.
+ *
+ * The direction is not uniform and getting it wrong inverts every conversion:
+ * most pairs are "how much of this currency buys one dollar", but EUR, GBP
+ * and AUD follow the market convention of quoting dollars per unit. Both the
+ * code list and the directions here were read off the live API.
+ */
+const CURRENCIES = {
+  KRW: { label: '원/달러', perUsd: true },
+  JPY: { label: '엔/달러', perUsd: true },
+  HKD: { label: '홍콩달러/달러', perUsd: true },
+  CNY: { label: '위안/달러', perUsd: true },
+  VND: { label: '동/달러', perUsd: true },
+  CAD: { label: '캐나다달러/달러', perUsd: true },
+  CHF: { label: '프랑/달러', perUsd: true },
+  SGD: { label: '싱가포르달러/달러', perUsd: true },
+  TWD: { label: '대만달러/달러', perUsd: true },
+  IDR: { label: '루피아/달러', perUsd: true },
+  THB: { label: '바트/달러', perUsd: true },
+  EUR: { label: '달러/유로', perUsd: false },
+  GBP: { label: '달러/파운드', perUsd: false },
+  AUD: { label: '달러/호주달러', perUsd: false },
+} as const;
+
+const FX_HEAD_FIELDS = {
+  hts_kor_isnm: 'name',
+  stck_shrn_iscd: 'code',
+  ovrs_nmix_prpr: 'last',
+  ovrs_nmix_prdy_clpr: 'previousClose',
+  ovrs_nmix_prdy_vrss: 'change',
+  prdy_vrss_sign: 'changeSign',
+  prdy_ctrt: 'changePercent',
+  ovrs_prod_oprc: 'open',
+  ovrs_prod_hgpr: 'high',
+  ovrs_prod_lwpr: 'low',
+  acml_vol: 'volume',
+} as const;
+
+const FX_ROW_FIELDS = {
+  stck_bsop_date: 'date',
+  ovrs_nmix_prpr: 'close',
+  ovrs_nmix_oprc: 'open',
+  ovrs_nmix_hgpr: 'high',
+  ovrs_nmix_lwpr: 'low',
+  acml_vol: 'volume',
+  mod_yn: 'modified',
+} as const;
+
 const BOOK_FIELDS = {
   rsym: 'realtimeSymbol',
   zdiv: 'decimals',
@@ -353,6 +402,12 @@ function startOfYear(): string {
   return `${new Date().getFullYear()}0101`;
 }
 
+function daysAgo(days: number): string {
+  const date = new Date();
+  date.setDate(date.getDate() - days);
+  return stamp(date);
+}
+
 const READ_ONLY = { readOnlyHint: true, openWorldHint: true } as const;
 
 function registerQuotationTools(server: McpServer, client: KisClient): void {
@@ -442,6 +497,48 @@ function registerQuotationTools(server: McpServer, client: KisClient): void {
         `${symb} on ${exchange}: bid ${String(data['pbid1'] ?? '?')} / ask ${String(data['pask1'] ?? '?')}`,
         data,
       );
+    },
+  );
+
+  server.registerTool(
+    'fx_rate',
+    {
+      title: 'Exchange rate',
+      description:
+        'Daily, weekly, monthly or yearly exchange rate history for one currency against the US dollar, defaulting to the last 30 days. `quotedAs` says which way round the pair is read: most are units of the currency per dollar, but EUR, GBP and AUD are dollars per unit. Rates are KIS\u0027s published quotes, not the rate any particular transaction settled at — for that, the FX rate on a realised trade is in `overseas_realized_pnl`.',
+      inputSchema: z.object({
+        currency: z
+          .enum(Object.keys(CURRENCIES) as [string, ...string[]])
+          .default('KRW')
+          .describe(
+            `Currency: ${Object.entries(CURRENCIES)
+              .map(([code, { label }]) => `${code} (${label})`)
+              .join(', ')}`,
+          ),
+        period: z.enum(['day', 'week', 'month', 'year']).default('day').describe('Bar size'),
+        startDate: yyyymmdd.optional().describe('First date, YYYYMMDD. Defaults to 30 days ago.'),
+        endDate: yyyymmdd.optional().describe('Last date, YYYYMMDD. Defaults to today.'),
+      }),
+      annotations: READ_ONLY,
+    },
+    async ({ currency, period, startDate, endDate }) => {
+      const from = startDate ?? daysAgo(30);
+      const to = endDate ?? today();
+      const body = await client.get(ENDPOINTS.fxRate, {
+        FID_COND_MRKT_DIV_CODE: 'X',
+        FID_INPUT_ISCD: `FX@${currency}`,
+        FID_INPUT_DATE_1: from,
+        FID_INPUT_DATE_2: to,
+        FID_PERIOD_DIV_CODE: { day: 'D', week: 'W', month: 'M', year: 'Y' }[period],
+      });
+
+      const pair = CURRENCIES[currency as keyof typeof CURRENCIES];
+      // KIS pads the series with blank entries; a row without a date is padding.
+      const bars = asRows(body['output2'], FX_ROW_FIELDS).filter((row) => row['date'] !== undefined && row['date'] !== '');
+      const head = withDirection(rename(body['output1'], FX_HEAD_FIELDS));
+      const quotedAs = pair.perUsd ? `${currency} per USD` : `USD per ${currency}`;
+      const data: Record<string, unknown> = { currency, quotedAs, from, to, ...head, bars };
+      return result(`${currency}: ${String(head['last'] ?? '?')} (${quotedAs}), ${bars.length} ${period} bars`, data);
     },
   );
 }
