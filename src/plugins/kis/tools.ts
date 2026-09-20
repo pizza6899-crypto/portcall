@@ -135,7 +135,13 @@ const DETAIL_FIELDS = {
   vnit: 'tradingUnit',
 } as const;
 
-const DAILY_HEAD_FIELDS = { rsym: 'realtimeSymbol', zdiv: 'decimals', nrec: 'previousClose' } as const;
+/**
+ * `nrec` is how many rows came back, not a price — the published sample labels
+ * it 전일종가, but it reads 100 on every call while exactly 100 bars arrive.
+ * Mapping it as a close would hand a caller `previousClose: 100` for a stock
+ * trading at 336.
+ */
+const DAILY_HEAD_FIELDS = { rsym: 'realtimeSymbol', zdiv: 'decimals', nrec: 'recordCount' } as const;
 
 const DAILY_ROW_FIELDS = {
   xymd: 'date',
@@ -534,7 +540,7 @@ function registerQuotationTools(server: McpServer, client: KisClient): void {
     {
       title: 'Overseas daily prices',
       description:
-        'Daily, weekly or monthly bars for one overseas-listed stock, newest first, ending at `endDate` (most recent session when omitted). KIS returns a bounded window per call rather than the full history.',
+        'Daily, weekly or monthly bars for one overseas-listed stock, newest first, ending at `endDate` (most recent session when omitted). KIS caps a call at 100 bars, so a longer history needs several calls walking `endDate` backwards.',
       inputSchema: z.object({
         exchange: quoteExchange,
         symbol,
