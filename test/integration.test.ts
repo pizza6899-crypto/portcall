@@ -217,3 +217,77 @@ describe('a misconfigured prefix stops the server rather than serving something 
     );
   });
 });
+
+describe('the KIS plugin', () => {
+  // Credentials are never used here: listing tools touches no KIS endpoint.
+  const credentials = { KIS_APP_KEY: 'test-key', KIS_APP_SECRET: 'test-secret' };
+
+  test('is mounted only once credentials are configured', async () => {
+    const without = await startServer({});
+    try {
+      const body = (await (await fetch(`${without.baseUrl}/healthz`)).json()) as { mounts: { route: string }[] };
+      assert.deepEqual(body.mounts.map((m) => m.route), ['/vault/mcp']);
+    } finally {
+      await without.stop();
+    }
+
+    const server = await startServer(credentials);
+    try {
+      const body = (await (await fetch(`${server.baseUrl}/healthz`)).json()) as { mounts: { route: string }[] };
+      assert.deepEqual(body.mounts.map((m) => m.route).sort(), ['/kis/mcp', '/vault/mcp']);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('serves quotations only until an account is configured', async () => {
+    const server = await startServer(credentials);
+    try {
+      const payload = await readRpc(await modernRequest(server.baseUrl, '/kis/mcp', 'tools/list'));
+      const tools = (payload.result as { tools: { name: string; annotations?: { readOnlyHint?: boolean } }[] }).tools;
+
+      // Prices are public; a portfolio is not. Exposing one must not expose the other.
+      assert.deepEqual(
+        tools.map((t) => t.name).sort(),
+        ['overseas_daily_prices', 'overseas_orderbook', 'overseas_quote', 'overseas_quote_detail'],
+      );
+      // The list above is the whole surface: a tool that could place, amend or
+      // cancel an order is not registered, so it cannot be called. Everything
+      // that is registered says so to the client.
+      for (const tool of tools) {
+        assert.equal(tool.annotations?.readOnlyHint, true, `${tool.name} must be marked read-only`);
+      }
+    } finally {
+      await server.stop();
+    }
+  });
+  test('adds the account tools once KIS_ACCOUNT is set, and still nothing that trades', async () => {
+    const server = await startServer({ ...credentials, KIS_ACCOUNT: '12345678-01' });
+    try {
+      const payload = await readRpc(await modernRequest(server.baseUrl, '/kis/mcp', 'tools/list'));
+      const tools = (payload.result as { tools: { name: string; annotations?: { readOnlyHint?: boolean } }[] }).tools;
+
+      assert.deepEqual(tools.map((t) => t.name).sort(), [
+        'overseas_daily_prices',
+        'overseas_executions',
+        'overseas_holdings',
+        'overseas_orderbook',
+        'overseas_quote',
+        'overseas_quote_detail',
+        'overseas_realized_pnl',
+      ]);
+      for (const tool of tools) {
+        assert.equal(tool.annotations?.readOnlyHint, true, `${tool.name} must be marked read-only`);
+      }
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('a malformed account number stops the server rather than mounting half-configured', async () => {
+    await assert.rejects(
+      () => startServer({ ...credentials, KIS_ACCOUNT: 'not-an-account' }),
+      /server exited early/,
+    );
+  });
+});

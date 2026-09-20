@@ -1,6 +1,6 @@
 /** Environment-derived settings. Nothing host-specific is baked into the source. */
 
-function optional(name: string): string | undefined {
+export function optional(name: string): string | undefined {
   const value = process.env[name];
   return value !== undefined && value.trim() !== '' ? value.trim() : undefined;
 }

@@ -57,6 +57,52 @@ and skips stdio entirely.
 The SDK builds a fresh server instance per request and disposes it with the
 request, so there is no session state to time out and no accumulating handles.
 
+## Plugins
+
+| Mount | Serves |
+|---|---|
+| `/vault/mcp` | `@bitbonsai/mcpvault` over the Obsidian vault at `PORTCALL_VAULT_PATH` |
+| `/kis/mcp` | Korea Investment & Securities overseas-stock quotations, read-only |
+
+### KIS
+
+Quotation tools, which need no account: `overseas_quote`,
+`overseas_quote_detail`, `overseas_daily_prices`, `overseas_orderbook`.
+
+Account tools, registered only when `KIS_ACCOUNT` is set: `overseas_holdings`
+(positions with cost, market value and unrealised P&L), `overseas_executions`
+(order and fill history, this year by default) and `overseas_realized_pnl`
+(realised gains per disposal with FX rates). Prices are public and a portfolio
+is not, so the two are opt-in separately.
+
+There is no capital gains tax tool because KIS exposes no tax API.
+`overseas_realized_pnl` returns the disposal-level record a filing is built
+from; the filing figures themselves come from KIS's own year-end statement.
+
+Read-only is enforced three ways. No ordering tool is implemented, so none can
+be called; the client refuses any path outside the allowlist; and within
+`/uapi/overseas-stock/v1/trading/` — where account inquiries sit alongside the
+order endpoints — it refuses any tr_id that is not an inquiry. KIS ends
+inquiry tr_ids with `R` and orders with `U` (`TTTS3012R` reads a balance,
+`TTTT1002U` buys). All three are covered by tests.
+
+The access token needs care rather than cleverness. KIS issues one valid for 24
+hours but refuses a re-issue within a minute of the last (`EGW00133`), so the
+store lives for the process rather than the request — `inProcess` builds a
+fresh server per request — mirrors the token to `~/.cache/portcall/` so a
+restart does not spend an issue, and collapses concurrent cold-start callers
+into a single request.
+
+Account queries are paged: KIS signals more rows with `tr_cont` of `F` or `M`
+and expects the next request to echo the cursor from the previous body. The
+client walks that automatically, up to a page ceiling.
+
+Values come back as strings, exactly as KIS sends them; `decimals` says how
+many places the venue quotes to. Quotes are delayed unless the account carries
+a real-time subscription. Note also that the quotation and account APIs use
+different exchange codes — `NAS` quotes Nasdaq, `NASD` covers the whole US
+market on an account query — so the tools keep the two sets apart.
+
 ## Protocol versions
 
 Portcall is built on `@modelcontextprotocol/server` v2, which serves two
@@ -91,6 +137,9 @@ All host-specific values come from the environment.
 | `PORTCALL_PATH_PREFIX` | *(unset)* | Serve every mount under `/<prefix>/…` |
 | `PORTCALL_KEEPALIVE_MS` | `15000` | SSE keepalive interval; `0` disables |
 | `PORTCALL_MODERN_ONLY` | `false` | Reject 2025-era requests instead of serving them |
+| `KIS_APP_KEY` | *(unset)* | Korea Investment app key. Unset leaves the KIS mount off entirely |
+| `KIS_APP_SECRET` | *(required with the key)* | App secret paired with `KIS_APP_KEY` |
+| `KIS_ACCOUNT` | *(unset)* | Account number, `12345678-01`. Unset serves quotations only |
 
 `PORTCALL_TOKEN` gates every mount with `Authorization: Bearer <token>`. Note
 that some MCP clients — Claude's custom connector UI among them — offer no way
@@ -169,11 +218,18 @@ src/
     inProcess.ts       library-factory adapter
   plugins/
     vault.ts           mcpvault
+    kis/               Korea Investment quotations (read-only)
+      index.ts         plugin factory, process-lifetime token store and client
+      client.ts        quotation allowlist, headers, throttle, error mapping
+      token.ts         access-token cache (memory + disk)
+      tools.ts         the quotation tools
 plugins.config.ts      which plugins mount at which paths
 test/
   integration.test.ts  black-box tests against the built server
   routes.test.ts       mount resolution
   auth.test.ts         bearer token check
+  kis-token.test.ts    token caching, single-flight, restart reload
+  kis-client.test.ts   allowlist, headers, KIS error surfacing
   helpers.ts           server harness and MCP request builders
 ```
 
