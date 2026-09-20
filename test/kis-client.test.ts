@@ -126,6 +126,11 @@ describe('KIS client', () => {
     assert.equal(ENDPOINTS.fxRate.path.startsWith(TRADING_NAMESPACE), false);
   });
 
+  test('the consolidated balance is an inquiry in the trading namespace', () => {
+    assert.ok(ENDPOINTS.balance.path.startsWith(TRADING_NAMESPACE));
+    assert.match(ENDPOINTS.balance.trId, /R$/);
+  });
+
   test('a paged call cannot run away', async () => {
     const { client, seen } = clientAnswering({ rt_cd: '0', output: [] }, 200, Array(50).fill('M'));
 

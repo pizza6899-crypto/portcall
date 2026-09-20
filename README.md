@@ -92,11 +92,14 @@ its owner.
 ### KIS
 
 Quotation tools, which need no account: `overseas_quote`,
-`overseas_quote_detail`, `overseas_daily_prices`, `overseas_orderbook` and
-`fx_rate` (exchange rate history for 14 currencies against the dollar).
+`overseas_quote_detail`, `overseas_daily_prices`, `overseas_orderbook`, `fx_rate` (exchange rate
+history for 14 currencies against the dollar) and `overseas_index` (Dow,
+Nasdaq Composite, Nasdaq 100, S&P 500).
 
-Account tools, registered only when `KIS_ACCOUNT` is set: `overseas_holdings`
-(positions with cost, market value and unrealised P&L), `overseas_executions`
+Account tools, registered only when `KIS_ACCOUNT` is set: `overseas_balance`
+(the whole account in one call — every position, cash and margin per
+currency, and totals including withdrawable cash), `overseas_holdings`
+(one exchange at a time, for its per-exchange totals), `overseas_executions`
 (order and fill history, this year by default) and `overseas_realized_pnl`
 (realised gains per disposal with FX rates). Prices are public and a portfolio
 is not, so the two are opt-in separately.
@@ -122,6 +125,12 @@ into a single request.
 Account queries are paged: KIS signals more rows with `tr_cont` of `F` or `M`
 and expects the next request to echo the cursor from the previous body. The
 client walks that automatically, up to a page ceiling.
+
+The won/foreign-currency flag is not consistent across KIS endpoints: the
+consolidated balance reads `01` as won, while the realised P&L endpoint reads
+`02` as won. Both were confirmed against the live API rather than the
+published parameter tables, and the tools present a single `report` option so
+the inconsistency stops at this boundary.
 
 Exchange rates are not all quoted the same way round: most pairs are units
 per dollar, but EUR, GBP and AUD are dollars per unit, so `fx_rate` states the

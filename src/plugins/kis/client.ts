@@ -39,6 +39,7 @@ export const ENDPOINTS = {
   fxRate: { path: '/uapi/overseas-price/v1/quotations/inquire-daily-chartprice', trId: 'FHKST03030100' },
   // Account inquiries — real-money tr_ids; the paper domain uses a `V` prefix.
   holdings: { path: '/uapi/overseas-stock/v1/trading/inquire-balance', trId: 'TTTS3012R' },
+  balance: { path: '/uapi/overseas-stock/v1/trading/inquire-present-balance', trId: 'CTRP6504R' },
   executions: { path: '/uapi/overseas-stock/v1/trading/inquire-ccnl', trId: 'TTTS3035R' },
   realizedPnl: { path: '/uapi/overseas-stock/v1/trading/inquire-period-profit', trId: 'TTTS3039R' },
 } as const satisfies Record<string, Endpoint>;

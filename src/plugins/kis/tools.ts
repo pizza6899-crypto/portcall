@@ -179,6 +179,14 @@ const CURRENCIES = {
   AUD: { label: '달러/호주달러', perUsd: false },
 } as const;
 
+/** Overseas indices this endpoint serves. The leading dot is not a pattern — it is only on the Dow. */
+const INDICES = {
+  '.DJI': '다우존스 산업평균',
+  COMP: '나스닥 종합',
+  NDX: '나스닥 100',
+  SPX: 'S&P 500',
+} as const;
+
 const FX_HEAD_FIELDS = {
   hts_kor_isnm: 'name',
   stck_shrn_iscd: 'code',
@@ -219,6 +227,78 @@ const BOOK_FIELDS = {
   bdvl: 'totalBidSizeChange',
   advl: 'totalAskSizeChange',
   code: 'symbol',
+} as const;
+
+const BALANCE_POSITION_FIELDS = {
+  pdno: 'symbol',
+  prdt_name: 'name',
+  ovrs_excg_cd: 'exchange',
+  tr_mket_name: 'market',
+  natn_kor_name: 'country',
+  cblc_qty13: 'quantity',
+  ord_psbl_qty1: 'sellableQuantity',
+  avg_unpr3: 'averageCost',
+  ovrs_now_pric1: 'last',
+  frcr_pchs_amt: 'costAmount',
+  frcr_evlu_amt2: 'marketValue',
+  evlu_pfls_amt2: 'unrealizedPnl',
+  evlu_pfls_rt1: 'unrealizedPnlPercent',
+  buy_crcy_cd: 'currency',
+  bass_exrt: 'fxRate',
+  pchs_rmnd_wcrc_amt: 'costAmountKrw',
+  thdt_buy_ccld_qty1: 'boughtToday',
+  thdt_sll_ccld_qty1: 'soldToday',
+  thdt_buy_ccld_frcr_amt: 'boughtTodayAmount',
+  thdt_sll_ccld_frcr_amt: 'soldTodayAmount',
+  ccld_qty_smtl1: 'filledQuantityTotal',
+  loan_dt: 'loanDate',
+  loan_expd_dt: 'loanMaturityDate',
+  loan_rmnd: 'loanBalance',
+  unit_amt: 'unitAmount',
+  prdt_type_cd: 'productTypeCode',
+  prdt_dvsn: 'productDivision',
+  scts_dvsn_name: 'securityType',
+  std_pdno: 'standardCode',
+  item_lnkg_excg_cd: 'linkedExchange',
+} as const;
+
+const BALANCE_CURRENCY_FIELDS = {
+  crcy_cd: 'currency',
+  crcy_cd_name: 'currencyName',
+  frcr_dncl_amt_2: 'cash',
+  frcr_drwg_psbl_amt_1: 'withdrawable',
+  nxdy_frcr_drwg_psbl_amt: 'withdrawableNextDay',
+  frcr_evlu_amt2: 'marketValue',
+  frcr_buy_amt_smtl: 'boughtTotal',
+  frcr_sll_amt_smtl: 'soldTotal',
+  frcr_buy_mgn_amt: 'buyMargin',
+  frcr_etc_mgna: 'otherMargin',
+  frst_bltn_exrt: 'fxRate',
+  acpl_cstd_crcy_yn: 'localCustody',
+} as const;
+
+const BALANCE_TOTAL_FIELDS = {
+  tot_asst_amt: 'totalAssets',
+  dncl_amt: 'cash',
+  tot_dncl_amt: 'cashTotal',
+  wdrw_psbl_tot_amt: 'withdrawableTotal',
+  frcr_use_psbl_amt: 'foreignCashAvailable',
+  evlu_amt_smtl: 'marketValueTotal',
+  evlu_amt_smtl_amt: 'marketValueTotalAmount',
+  pchs_amt_smtl: 'costTotal',
+  pchs_amt_smtl_amt: 'costTotalAmount',
+  tot_evlu_pfls_amt: 'unrealizedPnl',
+  evlu_pfls_amt_smtl: 'unrealizedPnlSum',
+  evlu_erng_rt1: 'returnPercent',
+  frcr_evlu_tota: 'foreignMarketValueTotal',
+  tot_frcr_cblc_smtl: 'foreignBalanceTotal',
+  buy_mgn_amt: 'buyMargin',
+  etc_mgna: 'otherMargin',
+  mgna_tota: 'marginTotal',
+  cma_evlu_amt: 'cmaValue',
+  tot_loan_amt: 'loanTotal',
+  ustl_buy_amt_smtl: 'unsettledBuyTotal',
+  ustl_sll_amt_smtl: 'unsettledSellTotal',
 } as const;
 
 const HOLDING_FIELDS = {
@@ -501,6 +581,45 @@ function registerQuotationTools(server: McpServer, client: KisClient): void {
   );
 
   server.registerTool(
+    'overseas_index',
+    {
+      title: 'Overseas index',
+      description:
+        'Daily, weekly, monthly or yearly history for a major overseas index, defaulting to the last 30 days. Only these four are served by this endpoint; individual constituents come from `overseas_daily_prices` instead.',
+      inputSchema: z.object({
+        index: z
+          .enum(Object.keys(INDICES) as [string, ...string[]])
+          .default('SPX')
+          .describe(
+            `Index: ${Object.entries(INDICES)
+              .map(([code, label]) => `${code} (${label})`)
+              .join(', ')}`,
+          ),
+        period: z.enum(['day', 'week', 'month', 'year']).default('day').describe('Bar size'),
+        startDate: yyyymmdd.optional().describe('First date, YYYYMMDD. Defaults to 30 days ago.'),
+        endDate: yyyymmdd.optional().describe('Last date, YYYYMMDD. Defaults to today.'),
+      }),
+      annotations: READ_ONLY,
+    },
+    async ({ index, period, startDate, endDate }) => {
+      const from = startDate ?? daysAgo(30);
+      const to = endDate ?? today();
+      const body = await client.get(ENDPOINTS.fxRate, {
+        FID_COND_MRKT_DIV_CODE: 'N',
+        FID_INPUT_ISCD: index,
+        FID_INPUT_DATE_1: from,
+        FID_INPUT_DATE_2: to,
+        FID_PERIOD_DIV_CODE: { day: 'D', week: 'W', month: 'M', year: 'Y' }[period],
+      });
+      const bars = asRows(body['output2'], FX_ROW_FIELDS).filter((row) => row['date'] !== undefined && row['date'] !== '');
+      const head = withDirection(rename(body['output1'], FX_HEAD_FIELDS));
+      const label = INDICES[index as keyof typeof INDICES];
+      const data: Record<string, unknown> = { index, label, from, to, ...head, bars };
+      return result(`${label}: ${String(head['last'] ?? '?')}, ${bars.length} ${period} bars`, data);
+    },
+  );
+
+  server.registerTool(
     'fx_rate',
     {
       title: 'Exchange rate',
@@ -573,6 +692,51 @@ function registerAccountTools(server: McpServer, client: KisClient, account: Kis
         totals: lastObject(pages, 'output2', HOLDING_TOTAL_FIELDS),
       };
       return result(`${data.positions.length} positions on ${exchange}`, data);
+    },
+  );
+
+  server.registerTool(
+    'overseas_balance',
+    {
+      title: 'Overseas account balance',
+      description:
+        'The whole overseas account in one call: every position across every market, a cash and margin breakdown per currency, and account totals including cash, withdrawable cash and total assets. Amounts can be reported converted to won or in the traded currency. Use this for "what do I hold" and "how much cash is there"; `overseas_holdings` covers one exchange at a time and is only worth it for its per-exchange totals.',
+      inputSchema: z.object({
+        report: z
+          .enum(['krw', 'foreign'])
+          .default('krw')
+          .describe('Report amounts converted to won, or in the traded currency'),
+        country: z
+          .enum(['all', 'us', 'hk', 'cn', 'jp', 'vn'])
+          .default('all')
+          .describe('Limit to one country'),
+      }),
+      annotations: READ_ONLY,
+    },
+    async ({ report, country }) => {
+      const body = await client.get(ENDPOINTS.balance, {
+        ...identity,
+        // Note the flag is the other way round here than in
+        // `overseas_realized_pnl`: this endpoint reads 01 as won, that one
+        // reads 02 as won. Confirmed against the live API, not the docs.
+        WCRC_FRCR_DVSN_CD: report === 'krw' ? '01' : '02',
+        NATN_CD: { all: '000', us: '840', hk: '344', cn: '156', jp: '392', vn: '704' }[country],
+        TR_MKET_CD: '00',
+        INQR_DVSN_CD: '00',
+      });
+
+      const totalsSource = Array.isArray(body['output3']) ? body['output3'][0] : body['output3'];
+      const data = {
+        reportedIn: report,
+        country,
+        positions: asRows(body['output1'], BALANCE_POSITION_FIELDS, ACCOUNT_ECHO),
+        currencies: asRows(body['output2'], BALANCE_CURRENCY_FIELDS),
+        totals: rename(totalsSource, BALANCE_TOTAL_FIELDS),
+      };
+      return result(
+        `${data.positions.length} positions, ${data.currencies.length} currencies, total assets ${String(data.totals['totalAssets'] ?? '?')}`,
+        data,
+      );
     },
   );
 
