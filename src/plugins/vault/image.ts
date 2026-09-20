@@ -117,7 +117,7 @@ function readImageTool(options: ImageToolOptions): ExtraTool<z.infer<typeof read
 
       const head = await readHead(full);
       const original = await measure(full, head);
-      const prepared = await prepareImage(full, original, maxEdge);
+      const prepared = await prepareImage(full, original, maxEdge, size);
 
       const described = original === undefined ? 'unknown size' : `${original.width}×${original.height}`;
       const notes = prepared.note === undefined ? '' : ` — ${prepared.note}`;

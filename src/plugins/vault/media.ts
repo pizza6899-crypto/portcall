@@ -202,6 +202,7 @@ export async function prepareImage(
   path: string,
   original: Dimensions | undefined,
   maxEdge: number,
+  bytesOnDisk: number,
 ): Promise<PreparedImage> {
   const extension = extensionOf(path);
   const native = NATIVE_TYPES[extension];
@@ -209,10 +210,13 @@ export async function prepareImage(
   const oversized = longestEdge !== undefined && longestEdge > maxEdge;
 
   if (native !== undefined && !oversized) {
-    const data = await readFile(path);
-    // Untouched is always best: it is the original pixels, and an animated
-    // GIF still animates.
-    if (data.byteLength <= MAX_IMAGE_BYTES) return { data, mimeType: native };
+    // Decided on the size on disk rather than by reading first: a file far
+    // over the budget would otherwise be pulled into memory only to be
+    // thrown away, and an animated GIF can be large while small on screen.
+    if (bytesOnDisk <= MAX_IMAGE_BYTES) {
+      // Untouched is always best: the original pixels, and a GIF still animates.
+      return { data: await readFile(path), mimeType: native };
+    }
     return convert(path, extension, Math.min(maxEdge, longestEdge ?? maxEdge), `re-encoded to fit ${MAX_IMAGE_BYTES} bytes`);
   }
 

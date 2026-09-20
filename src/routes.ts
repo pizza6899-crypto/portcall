@@ -66,8 +66,38 @@ export function detailedHealthRoute(pathPrefix?: string | undefined): string {
   return pathPrefix === undefined ? '/healthz' : `/${pathPrefix}/healthz`;
 }
 
-/** Normalise a request URL to the form the mount table is keyed by. */
+/**
+ * Normalise a request URL to the form the mount table is keyed by.
+ *
+ * A request target is a path, not a URL reference. Resolving it against a
+ * base gets two things wrong: `//host/path` is read as an authority, and a
+ * target the URL parser dislikes — `//` among them — throws. Throwing here
+ * happens before authentication, on a request anyone can send, and takes the
+ * process with it. So the common case is handled as the string it is, and
+ * the absolute form a proxy may send is parsed separately.
+ *
+ * No `.`/`..` resolution: the mount table is matched exactly, so a target
+ * that needs normalising is one that should miss.
+ */
 export function routeKey(url: string | undefined): string {
-  const pathname = new URL(url ?? '/', 'http://localhost').pathname;
-  return pathname.replace(/\/+$/, '') || '/';
+  const target = url ?? '/';
+  const path = absoluteFormPath(target) ?? originFormPath(target);
+  return path.replace(/\/+$/, '') || '/';
+}
+
+/** The path of an absolute-form target (`GET http://host/path`), if it is one. */
+function absoluteFormPath(target: string): string | undefined {
+  if (!/^https?:\/\//i.test(target)) return undefined;
+  try {
+    return new URL(target).pathname;
+  } catch {
+    // Malformed, so it matches nothing — which is what `/` does here.
+    return '/';
+  }
+}
+
+function originFormPath(target: string): string {
+  const marker = target.search(/[?#]/);
+  const path = marker === -1 ? target : target.slice(0, marker);
+  return path.startsWith('/') ? path : `/${path}`;
 }

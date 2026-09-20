@@ -19,6 +19,9 @@ const RENEW_MARGIN_MS = 10 * 60_000;
 /** Assumed lifetime when the response omits `expires_in`. */
 const ASSUMED_LIFETIME_MS = 24 * 60 * 60_000;
 
+/** How long the token request may take. It is a single small POST. */
+const TOKEN_TIMEOUT_MS = 15_000;
+
 export interface KisToken {
   value: string;
   /** Epoch millis at which the token stops being valid. */
@@ -101,8 +104,11 @@ export function createTokenStore(options: TokenStoreOptions): TokenStore {
 
   async function issue(): Promise<KisToken> {
     const issuedAt = now();
+    // Every KIS tool call waits on this one request when the cache is cold,
+    // so a stall here stalls all of them, not just the caller that triggered it.
     const response = await fetchImpl(`${baseUrl}/oauth2/tokenP`, {
       method: 'POST',
+      signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ grant_type: 'client_credentials', appkey: appKey, appsecret: appSecret }),
     });

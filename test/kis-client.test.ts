@@ -10,14 +10,16 @@ interface Recorded {
   headers: Headers;
 }
 
-function clientAnswering(payload: unknown, status = 200, trConts: string[] = []) {
+/** `payload` may be a function of the call index, for a cursor that advances. */
+function clientAnswering(payload: unknown | ((call: number) => unknown), status = 200, trConts: string[] = []) {
   const seen: Recorded[] = [];
   let call = 0;
   const fetchImpl = (async (input: URL, init: RequestInit) => {
     seen.push({ url: new URL(input), headers: new Headers(init.headers) });
     const trCont = trConts[call];
+    const body = typeof payload === 'function' ? (payload as (n: number) => unknown)(call) : payload;
     call += 1;
-    return new Response(JSON.stringify(payload), {
+    return new Response(JSON.stringify(body), {
       status,
       ...(trCont === undefined ? {} : { headers: { tr_cont: trCont } }),
     });
@@ -104,8 +106,15 @@ describe('KIS client', () => {
   });
 
   test('a paged call follows the continuation cursor and stops', async () => {
+    // A real cursor moves on each page; KIS returns a fresh resume point with
+    // every continuation.
     const { client, seen } = clientAnswering(
-      { rt_cd: '0', output: [{ odno: '1' }], ctx_area_fk200: 'FK', ctx_area_nk200: 'NK' },
+      (call: number) => ({
+        rt_cd: '0',
+        output: [{ odno: String(call) }],
+        ctx_area_fk200: `FK${call}`,
+        ctx_area_nk200: `NK${call}`,
+      }),
       200,
       ['M', 'M', 'D'],
     );
@@ -115,8 +124,8 @@ describe('KIS client', () => {
     assert.equal(pages.length, 3, 'must stop once tr_cont is no longer F or M');
     assert.equal(seen[0]!.headers.get('tr_cont'), null, 'the first page carries no continuation header');
     assert.equal(seen[1]!.headers.get('tr_cont'), 'N');
-    assert.equal(seen[1]!.url.searchParams.get('CTX_AREA_NK200'), 'NK');
-    assert.equal(seen[1]!.url.searchParams.get('CTX_AREA_FK200'), 'FK');
+    assert.equal(seen[1]!.url.searchParams.get('CTX_AREA_NK200'), 'NK0');
+    assert.equal(seen[1]!.url.searchParams.get('CTX_AREA_FK200'), 'FK0');
   });
 
   test('the exchange rate endpoint is a quotation, not an account call', () => {
@@ -132,11 +141,52 @@ describe('KIS client', () => {
   });
 
   test('a paged call cannot run away', async () => {
-    const { client, seen } = clientAnswering({ rt_cd: '0', output: [] }, 200, Array(50).fill('M'));
+    const { client, seen } = clientAnswering(
+      (call: number) => ({ rt_cd: '0', output: [], ctx_area_fk200: `FK${call}`, ctx_area_nk200: `NK${call}` }),
+      200,
+      Array(50).fill('M'),
+    );
 
     const pages = await client.getAll(ENDPOINTS.executions, {}, 3);
 
     assert.equal(pages.length, 3);
     assert.equal(seen.length, 3);
+  });
+
+  test('stops paging when KIS hands back the same resume point', async () => {
+    // `tr_cont: M` with no cursor means the next request repeats this one, so
+    // walking on would collect the same rows until the page ceiling.
+    const { client, seen } = clientAnswering(
+      { rt_cd: '0', output1: [{ a: 1 }], ctx_area_fk200: '', ctx_area_nk200: '' },
+      200,
+      ['M', 'M', 'M', 'M'],
+    );
+
+    const pages = await client.getAll(ENDPOINTS.executions, { CANO: '12345678' });
+
+    assert.equal(pages.length, 1, 'one page, not the same page over and over');
+    assert.equal(seen.length, 1);
+  });
+
+  test('gives every call a deadline', async () => {
+    const signals: (AbortSignal | undefined)[] = [];
+    const fetchImpl = (async (_input: URL, init: RequestInit) => {
+      signals.push(init.signal ?? undefined);
+      return new Response(JSON.stringify({ rt_cd: '0', output: {} }));
+    }) as unknown as typeof fetch;
+
+    const client = createKisClient({
+      baseUrl: BASE,
+      appKey: 'key',
+      appSecret: 'secret',
+      getToken: async () => 'token',
+      fetchImpl,
+      minIntervalMs: 0,
+    });
+
+    await client.get(ENDPOINTS.price, { AUTH: '', EXCD: 'NAS', SYMB: 'AAPL' });
+
+    // A stalled connection must not leave the tool call hanging indefinitely.
+    assert.ok(signals[0] instanceof AbortSignal, 'fetch is given an abort signal');
   });
 });

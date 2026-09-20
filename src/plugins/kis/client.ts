@@ -52,6 +52,9 @@ const ALLOWED_PATHS = new Set<string>(Object.values(ENDPOINTS).map((e) => e.path
  */
 const DEFAULT_MIN_INTERVAL_MS = 60;
 
+/** How long one KIS call may take. Their quotation endpoints answer in well under a second. */
+const DEFAULT_TIMEOUT_MS = 15_000;
+
 /** How many continuation pages one paged call will walk before giving up. */
 const DEFAULT_MAX_PAGES = 20;
 
@@ -62,6 +65,8 @@ export interface KisClientOptions {
   getToken: () => Promise<string>;
   fetchImpl?: typeof fetch;
   minIntervalMs?: number;
+  /** How long one KIS call may take before it is abandoned. */
+  timeoutMs?: number;
 }
 
 export interface KisClient {
@@ -114,6 +119,7 @@ export function createKisClient(options: KisClientOptions): KisClient {
     getToken,
     fetchImpl = fetch,
     minIntervalMs = DEFAULT_MIN_INTERVAL_MS,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
   } = options;
 
   // Requests queue behind one another so the spacing holds across concurrent
@@ -143,8 +149,11 @@ export function createKisClient(options: KisClientOptions): KisClient {
     const url = new URL(endpoint.path, baseUrl);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
 
+    // Without a deadline a stalled connection leaves the tool call hanging
+    // for as long as the client will wait, with nothing said about why.
     const response = await fetchImpl(url, {
       method: 'GET',
+      signal: AbortSignal.timeout(timeoutMs),
       headers: {
         'content-type': 'application/json; charset=utf-8',
         authorization: `Bearer ${token}`,
@@ -193,8 +202,15 @@ export function createKisClient(options: KisClientOptions): KisClient {
 
         if (trCont !== 'F' && trCont !== 'M') break;
 
-        fk200 = cursor(body, 'ctx_area_fk200');
-        nk200 = cursor(body, 'ctx_area_nk200');
+        const nextFk = cursor(body, 'ctx_area_fk200');
+        const nextNk = cursor(body, 'ctx_area_nk200');
+        // KIS says there is more but hands back the same resume point, so the
+        // next request would return this page again. Stop rather than collect
+        // the same rows `maxPages` times.
+        if (nextFk === fk200 && nextNk === nk200) break;
+
+        fk200 = nextFk;
+        nk200 = nextNk;
         continuation = 'N';
       }
 

@@ -58,6 +58,32 @@ describe('resolveMounts', () => {
 });
 
 describe('routeKey', () => {
+  test('survives a target the URL parser will not take', () => {
+    // `GET //` reaches the listener before authentication, so a throw here
+    // would be an unauthenticated way to stop the process — and, because the
+    // guard keeps its state in memory, to clear an active block.
+    for (const target of ['//', '///', 'http://[', '//a//', '*']) {
+      assert.doesNotThrow(() => routeKey(target), `routeKey(${JSON.stringify(target)})`);
+    }
+    assert.equal(routeKey('//'), '/');
+    assert.equal(routeKey('///'), '/');
+  });
+
+  test('reads a leading double slash as a path, not a host', () => {
+    // Resolved against a base, `//evil.com/mcp` becomes `/mcp` — which is a
+    // real mount when the root alias is configured.
+    assert.equal(routeKey('//evil.com/mcp'), '//evil.com/mcp');
+  });
+
+  test('does not resolve dot segments, so an odd target simply misses', () => {
+    assert.equal(routeKey('/vault/../etc'), '/vault/../etc');
+  });
+
+  test('takes the path out of an absolute-form target', () => {
+    assert.equal(routeKey('http://example.com/vault/mcp'), '/vault/mcp');
+  });
+
+
   test('keeps a plain path as-is', () => {
     assert.equal(routeKey('/vault/mcp'), '/vault/mcp');
   });

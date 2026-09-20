@@ -394,3 +394,54 @@ describe('abuse control', () => {
     }
   });
 });
+
+describe('a hostile request target', () => {
+  let server: RunningServer;
+  const token = 'survive-token';
+
+  before(async () => {
+    server = await startServer({ PORTCALL_TOKEN: token, PORTCALL_ALIAS_ROOT_MCP: 'vault' });
+  });
+
+  after(async () => {
+    await server.stop();
+  });
+
+  test('does not take the process down', async () => {
+    // `GET //` is answered before authentication, so a crash here is an
+    // unauthenticated kill — and, since the guard keeps its state in memory,
+    // a way to clear a block that is meant to stop credential guessing.
+    for (const target of ['//', '///', '//evil.com/mcp', '/%2e%2e/', '/a%20b']) {
+      const res = await fetch(`${server.baseUrl}${target}`);
+      assert.ok(res.status >= 200 && res.status < 500, `${target} answered ${res.status}`);
+      await res.text();
+    }
+
+    const health = await fetch(`${server.baseUrl}/healthz`);
+    assert.equal(health.status, 200, 'the server is still up afterwards');
+  });
+
+  test('a double slash does not reach the root alias', async () => {
+    // Resolved against a base, `//evil.com/mcp` would become `/mcp`.
+    const res = await fetch(`${server.baseUrl}//evil.com/mcp`);
+    assert.equal(res.status, 404);
+    assert.deepEqual(await res.json(), { error: 'not_found' });
+  });
+
+  test('a block cannot be cleared by crashing the process', async () => {
+    const guessing = { Authorization: 'Bearer wrong' };
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      await fetch(`${server.baseUrl}/vault/mcp`, { method: 'POST', headers: guessing }).then((r) => r.text());
+    }
+
+    const blocked = await fetch(`${server.baseUrl}/vault/mcp`, { method: 'POST', headers: guessing });
+    assert.equal(blocked.status, 429, 'guessing trips the block');
+    await blocked.text();
+
+    await fetch(`${server.baseUrl}//`).then((r) => r.text());
+
+    const stillBlocked = await fetch(`${server.baseUrl}/vault/mcp`, { method: 'POST', headers: guessing });
+    assert.equal(stillBlocked.status, 429, 'the block survives the malformed target');
+    await stillBlocked.text();
+  });
+});
