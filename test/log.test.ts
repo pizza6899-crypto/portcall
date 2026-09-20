@@ -17,7 +17,9 @@ describe('describeHeaders', () => {
   });
 
   test('repeated headers are joined', () => {
-    assert.deepEqual(describeHeaders({ 'set-cookie': ['a=1', 'b=2'] }), { 'set-cookie': 'a=1, b=2' });
+    assert.deepEqual(describeHeaders({ accept: ['application/json', 'text/event-stream'] }), {
+      accept: 'application/json, text/event-stream',
+    });
   });
 
   test('a bearer secret never appears in the output', () => {
@@ -41,6 +43,35 @@ describe('describeHeaders', () => {
     for (const name of ['Authorization', 'X-API-Key', 'x-auth-token', 'Cookie', 'proxy-authorization']) {
       assert.equal(describeHeaders({ [name]: TOKEN })[name]?.includes(TOKEN), false, name);
     }
+  });
+
+  test('a header nobody listed is redacted rather than trusted', () => {
+    // The rule this follows: decide what to print, do not guess at what to
+    // hide. A name-based blacklist only ever catches the secrets someone
+    // thought of — the leak that prompted this was stored under `value`.
+    for (const name of ['x-internal-secret', 'value', 'x-vault-key', 'x-amz-security-token']) {
+      const described = describeHeaders({ [name]: TOKEN })[name] ?? '';
+      assert.equal(described.includes(TOKEN), false, `${name} leaked its value`);
+      assert.equal(described, `<${TOKEN.length} chars, ${digest(TOKEN)}>`, name);
+    }
+  });
+
+  test('an unknown header keeps none of its value, not even the first word', () => {
+    // `sketch` keeps the scheme, which is right for `Bearer <token>` and
+    // wrong for a header whose first word could be the secret.
+    assert.equal(describeHeaders({ 'x-odd': 'secret-part other-part' })['x-odd']?.includes('secret-part'), false);
+  });
+
+  test('the headers worth reading still read', () => {
+    const headers = {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      'user-agent': 'claude-connector/1.0',
+      'mcp-protocol-version': '2026-07-28',
+      'cf-connecting-ip': '203.0.113.7',
+      host: 'mcp.example.com',
+    };
+    assert.deepEqual(describeHeaders(headers), headers, 'redaction must not blind the diagnostic');
   });
 });
 

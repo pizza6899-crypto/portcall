@@ -204,6 +204,26 @@ describe('secret path prefix', () => {
     assert.equal(res.status, 404);
   });
 
+  test('the prefix does not land in the log file in the clear', async () => {
+    // It is a bearer secret that happens to travel in the URL, and this log
+    // is the one place the process controls. Reducing it the way a token is
+    // reduced keeps the line useful without writing the secret down.
+    await modernRequest(server.baseUrl, `/${prefix}/vault/mcp`, 'tools/list');
+    const logged = server.output();
+
+    assert.ok(logged.includes('"pathname"'), 'requests are being logged at all');
+    assert.equal(logged.includes(prefix), false, 'the prefix itself never appears');
+    assert.ok(logged.includes('<prefix '), 'and the line still says the prefix matched');
+    assert.ok(logged.includes('/vault/mcp'), 'while naming the mount that was hit');
+  });
+
+  test('a path that does not carry the prefix is logged as it came', async () => {
+    // That is the caller's guess rather than our secret, and seeing it is
+    // the reason the line exists.
+    await modernRequest(server.baseUrl, '/someone-elses-guess/vault/mcp', 'tools/list');
+    assert.ok(server.output().includes('/someone-elses-guess/vault/mcp'));
+  });
+
   test('the public health endpoint stays alive but hides the mounts', async () => {
     const res = await fetch(`${server.baseUrl}/healthz`);
     assert.equal(res.status, 200);

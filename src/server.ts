@@ -30,6 +30,22 @@ const guard = createGuard({
  */
 const trustProxyHeader = isLoopback(config.host);
 
+/**
+ * The request path as it goes into the log.
+ *
+ * A configured prefix is a secret carried in the URL, and this log file is
+ * the one place that is under this process's control. It is reduced the same
+ * way a bearer token is, so a line still says which mount was hit. A path
+ * that does not carry the prefix is logged as it came — that is the caller's
+ * guess, not our secret, and seeing it is the point of the line.
+ */
+function loggedPath(pathname: string): string {
+  if (config.pathPrefix === undefined) return pathname;
+  const head = `/${config.pathPrefix}`;
+  if (pathname !== head && !pathname.startsWith(`${head}/`)) return pathname;
+  return `/<prefix ${digest(config.pathPrefix)}>${pathname.slice(head.length)}`;
+}
+
 function json(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
@@ -87,7 +103,7 @@ const httpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) 
 
   log.info('request', {
     method: req.method,
-    pathname,
+    pathname: loggedPath(pathname),
     ...(config.logHeaders
       ? { headers: describeHeaders(req.headers) }
       : {
@@ -134,7 +150,7 @@ const httpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) 
     // one event that says someone is guessing, and it is worthless if it only
     // shows up when the operator already suspected something.
     log.warn('rejected', {
-      pathname,
+      pathname: loggedPath(pathname),
       client,
       ...(config.token === undefined ? {} : { expectedToken: digest(config.token) }),
       ...(blocked ? { blockedForSeconds: Math.round(config.guardBlockMs / 1000) } : {}),
@@ -163,7 +179,9 @@ const httpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) 
 httpServer.listen(config.port, config.host, () => {
   log.info('portcall listening', {
     address: `http://${config.host}:${config.port}`,
-    mounts: [...routes.keys()],
+    // Same reduction as the request lines: this banner lists every mount, so
+    // without it the prefix is written down in full on every single boot.
+    mounts: [...routes.keys()].map(loggedPath),
     authRequired: config.token !== undefined,
     guard: `${config.guardFailureLimit} failures / ${Math.round(config.guardWindowMs / 1000)}s → block ${Math.round(config.guardBlockMs / 1000)}s; ${config.guardRateLimit} req / ${Math.round(config.guardRateWindowMs / 1000)}s`,
     trustProxyHeader,

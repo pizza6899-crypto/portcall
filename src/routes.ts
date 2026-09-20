@@ -16,7 +16,10 @@ export interface MountOptions {
 
 function assertSegment(value: string, what: string): void {
   if (value === '' || value.includes('/')) {
-    throw new Error(`${what} must be a single non-empty path segment, got: ${value}`);
+    // The value is not echoed. A startup error lands in a log file, and a
+    // rejected prefix is close enough to the working one to be worth keeping
+    // out of it — a typo of a secret is still most of the secret.
+    throw new Error(`${what} must be a single non-empty path segment, with no slashes in it.`);
   }
 }
 

@@ -33,6 +33,8 @@ export async function makeVault(): Promise<string> {
 
 export interface RunningServer {
   baseUrl: string;
+  /** Everything the server has written to stdout and stderr so far. */
+  output: () => string;
   stop: () => Promise<void>;
 }
 
@@ -75,6 +77,7 @@ export async function startServer(env: Record<string, string>): Promise<RunningS
 
   return {
     baseUrl,
+    output: () => output,
     stop: async () => {
       child.kill('SIGTERM');
       await new Promise<void>((resolve) => child.once('exit', () => resolve()));

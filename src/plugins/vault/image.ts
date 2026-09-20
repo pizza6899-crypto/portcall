@@ -1,12 +1,13 @@
 import { lookup } from 'node:dns/promises';
-import { mkdir, open, readFile, stat, unlink, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, relative, resolve } from 'node:path';
+import { mkdir, open, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { z } from 'zod';
 
 import type { ExtraTool, ToolResult } from './merge.js';
 import {
   MAX_EDGE,
   canonicalExtension,
+  extensionMatchesFormat,
   extensionOf,
   isImagePath,
   parseDimensions,
@@ -59,6 +60,25 @@ async function readHead(path: string, bytes = HEADER_BYTES): Promise<Buffer> {
 
 async function measure(full: string, head: Buffer): Promise<Dimensions | undefined> {
   return parseDimensions(head) ?? (await probeDimensions(full));
+}
+
+/** First read when only the dimensions are wanted, before falling back to more. */
+const QUICK_HEADER_BYTES = 1024;
+
+/**
+ * Dimensions for a listing, reading as little as will answer.
+ *
+ * PNG, GIF and WebP put their size in the first few dozen bytes. A JPEG puts
+ * it after every metadata segment, and a photo carrying an EXIF thumbnail
+ * pushes that well past a kilobyte — those were being listed with no
+ * dimensions at all. The longer read only happens when the short one came
+ * back with nothing and there is actually more file to read.
+ */
+async function listingDimensions(full: string): Promise<Dimensions | undefined> {
+  const brief = await readHead(full, QUICK_HEADER_BYTES);
+  const answered = parseDimensions(brief);
+  if (answered !== undefined || brief.byteLength < QUICK_HEADER_BYTES) return answered;
+  return parseDimensions(await readHead(full));
 }
 
 /** Find the one image an embed target names, or explain why there is not one. */
@@ -233,7 +253,7 @@ function findImagesTool(options: ImageToolOptions): ExtraTool<z.infer<typeof fin
         const { size } = await stat(full);
         selectedBytes += size;
         if (rows.length >= limit) continue;
-        const dimensions = extensionOf(image) === 'svg' ? undefined : parseDimensions(await readHead(full, 1024));
+        const dimensions = extensionOf(image) === 'svg' ? undefined : await listingDimensions(full);
         rows.push({
           path: image,
           bytes: size,
@@ -280,6 +300,10 @@ const writeSchema = z
 /**
  * Addresses that must not be reachable through this tool.
  *
+ * Exported so the ranges can be asserted directly: the tool itself refuses
+ * every address a test could stand a server on, so there is no way to reach
+ * this through `write_image`.
+ *
  * The daemon is exposed to the internet through a tunnel, so a URL import is
  * a way to ask it to make a request from inside the home network. Every hop
  * is checked, not just the first, because otherwise a public host could
@@ -287,23 +311,45 @@ const writeSchema = z
  * narrows the hole rather than closing it — good enough for a personal
  * service, and the reason the check exists at all.
  */
-function isPrivateAddress(address: string): boolean {
-  if (address.includes(':')) {
-    const normalised = address.toLowerCase();
-    return (
-      normalised === '::1' ||
-      normalised === '::' ||
-      normalised.startsWith('fe80') ||
-      normalised.startsWith('fc') ||
-      normalised.startsWith('fd')
-    );
+export function isPrivateAddress(address: string): boolean {
+  const normalised = address.trim().toLowerCase();
+
+  if (normalised.includes(':')) {
+    // An IPv4-mapped address is an IPv4 destination in IPv6 notation, in
+    // either spelling. A host that answers AAAA with `::ffff:127.0.0.1`
+    // would otherwise skip every IPv4 rule below.
+    const dotted = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(normalised);
+    if (dotted !== null) return isPrivateAddress(dotted[1]!);
+
+    const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(normalised);
+    if (hex !== null) {
+      const high = Number.parseInt(hex[1]!, 16);
+      const low = Number.parseInt(hex[2]!, 16);
+      return isPrivateAddress(`${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`);
+    }
+
+    if (normalised === '::1' || normalised === '::') return true;
+    if (/^fe[89ab]/.test(normalised)) return true; // link-local, fe80::/10
+    if (/^f[cd]/.test(normalised)) return true; // unique local, fc00::/7
+    return false;
   }
-  const parts = address.split('.').map(Number);
-  const [a = 0, b = 0] = parts;
+
+  const parts = normalised.split('.');
+  const octets = parts.map(Number);
+  // Anything that is not a plain dotted quad is something this cannot reason
+  // about, and guessing in the permissive direction is the wrong way to be
+  // wrong here.
+  if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return true;
+
+  const [a = 0, b = 0, c = 0] = octets;
   if (a === 10 || a === 127 || a === 0) return true;
   if (a === 172 && b >= 16 && b <= 31) return true;
   if (a === 192 && b === 168) return true;
-  if (a === 169 && b === 254) return true;
+  if (a === 169 && b === 254) return true; // link-local, and cloud metadata
+  if (a === 100 && b >= 64 && b <= 127) return true; // carrier-grade NAT, where Tailscale lives
+  if (a === 192 && b === 0 && c === 0) return true; // IETF protocol assignments
+  if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking
+  if (a >= 224) return true; // multicast, reserved, broadcast
   return false;
 }
 
@@ -339,9 +385,36 @@ async function download(rawUrl: string): Promise<Buffer> {
   const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
   if (!contentType.startsWith('image/')) throw new Error(`That URL is not an image: ${contentType || 'no content-type'}`);
 
-  const bytes = Buffer.from(await response.arrayBuffer());
-  if (bytes.byteLength > MAX_WRITE_BYTES) throw new Error(`Image is larger than ${MAX_WRITE_BYTES} bytes.`);
-  return bytes;
+  return await drain(response);
+}
+
+/**
+ * Read a response body, stopping the moment it goes over the limit.
+ *
+ * Buffering first and measuring afterwards makes the limit advisory: the
+ * bytes are already in memory by the time it is checked, so a server that
+ * answers with gigabytes takes the daemon with it. `content-length` is
+ * consulted first because it is free, and then ignored — it is absent on a
+ * chunked response and can simply be wrong.
+ */
+export async function drain(response: Response): Promise<Buffer> {
+  const declared = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > MAX_WRITE_BYTES) {
+    throw new Error(`That image declares ${declared} bytes, over the ${MAX_WRITE_BYTES} byte limit.`);
+  }
+  if (response.body === null) throw new Error('That URL returned no body.');
+
+  const chunks: Buffer[] = [];
+  let received = 0;
+  for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+    received += chunk.byteLength;
+    if (received > MAX_WRITE_BYTES) {
+      // Leaving the loop cancels the stream, so the rest is never pulled.
+      throw new Error(`That image is larger than ${MAX_WRITE_BYTES} bytes.`);
+    }
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
 }
 
 async function importLocal(sourcePath: string, importRoots: readonly string[]): Promise<Buffer> {
@@ -381,6 +454,12 @@ function writeImageTool(options: ImageToolOptions): ExtraTool<z.infer<typeof wri
         throw new Error(`${path} already exists. Pass overwrite: true to replace it.`);
       }
 
+      // Opened before a single byte is written. Discovering the note is
+      // missing afterwards left the image in the vault while telling the
+      // caller only that the embed failed — and the corrected retry then hit
+      // the overwrite guard for a file it did not know it had created.
+      const note = embedIn === undefined ? undefined : await openNote(options.vaultPath, embedIn);
+
       const bytes =
         data !== undefined
           ? Buffer.from(data, 'base64')
@@ -394,16 +473,17 @@ function writeImageTool(options: ImageToolOptions): ExtraTool<z.infer<typeof wri
       const format = sniffFormat(bytes);
       if (format === undefined) throw new Error('Those bytes are not a recognised image format.');
       const extension = extensionOf(path);
-      const expected = canonicalExtension(format);
-      if (extension !== expected && !(expected === 'jpg' && extension === 'jpeg')) {
-        throw new Error(`The data is ${format.toUpperCase()} but the path ends in .${extension}. Use .${expected}.`);
+      if (!extensionMatchesFormat(extension, format)) {
+        throw new Error(
+          `The data is ${format.toUpperCase()} but the path ends in .${extension}. Use .${canonicalExtension(format)}.`,
+        );
       }
 
       await mkdir(dirname(destination), { recursive: true });
-      await writeFile(destination, bytes);
+      await place(destination, bytes);
 
       const dimensions = parseDimensions(bytes);
-      const embedded = embedIn === undefined ? undefined : await appendEmbed(options.vaultPath, embedIn, path, alt);
+      const embedded = note === undefined ? undefined : await appendEmbed(options.vaultPath, note, path, alt);
 
       return result(
         `Wrote ${path} (${bytes.byteLength} bytes${dimensions === undefined ? '' : `, ${dimensions.width}×${dimensions.height}`})${embedded === undefined ? '' : ` and embedded it in ${embedIn}`}.`,
@@ -420,24 +500,47 @@ function writeImageTool(options: ImageToolOptions): ExtraTool<z.infer<typeof wri
   };
 }
 
-/** Append an embed to a note, using the short form when the name is unambiguous. */
-async function appendEmbed(
-  vaultPath: string,
-  notePath: string,
-  imagePath: string,
-  alt: string | undefined,
-): Promise<string> {
-  const note = insideVault(vaultPath, notePath.toLowerCase().endsWith('.md') ? notePath : `${notePath}.md`);
-  const markdown = await readFile(note, 'utf8').catch(() => {
+/**
+ * Put a file in place in one step.
+ *
+ * Written straight to its destination, a crash mid-write leaves a truncated
+ * image under a name that says it is a whole one — and this vault has no
+ * backup behind it. The staging file is a dotfile so a vault walk that lands
+ * in between does not list it.
+ */
+async function place(destination: string, bytes: Buffer): Promise<void> {
+  const staging = join(dirname(destination), `.portcall-${process.pid}-${basename(destination)}.tmp`);
+  try {
+    await writeFile(staging, bytes);
+    await rename(staging, destination);
+  } catch (error) {
+    await rm(staging, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+interface Note {
+  full: string;
+  markdown: string;
+}
+
+/** Find the note an embed will be appended to, before anything is written. */
+async function openNote(vaultPath: string, notePath: string): Promise<Note> {
+  const full = insideVault(vaultPath, notePath.toLowerCase().endsWith('.md') ? notePath : `${notePath}.md`);
+  const markdown = await readFile(full, 'utf8').catch(() => {
     throw new Error(`No note to embed into: ${notePath}`);
   });
+  return { full, markdown };
+}
 
+/** Append an embed to a note, using the short form when the name is unambiguous. */
+async function appendEmbed(vaultPath: string, note: Note, imagePath: string, alt: string | undefined): Promise<string> {
   const files = await walkVault(vaultPath);
-  const basename = imagePath.slice(imagePath.lastIndexOf('/') + 1);
-  const target = resolveTarget(basename, files).length === 1 ? basename : imagePath;
+  const name = imagePath.slice(imagePath.lastIndexOf('/') + 1);
+  const target = resolveTarget(name, files).length === 1 ? name : imagePath;
   const embed = alt === undefined ? `![[${target}]]` : `![[${target}|${alt}]]`;
 
-  await writeFile(note, `${markdown.replace(/\s*$/, '')}\n\n${embed}\n`, 'utf8');
+  await writeFile(note.full, `${note.markdown.replace(/\s*$/, '')}\n\n${embed}\n`, 'utf8');
   return embed;
 }
 

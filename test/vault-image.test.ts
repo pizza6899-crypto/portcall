@@ -1,7 +1,7 @@
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -9,7 +9,7 @@ import { deflateSync, crc32 } from 'node:zlib';
 
 const run = promisify(execFile);
 
-import { InMemoryTransport } from '@modelcontextprotocol/server';
+import { InMemoryTransport, Server } from '@modelcontextprotocol/server';
 import { createServer } from '@bitbonsai/mcpvault';
 
 import { imageTools } from '../src/plugins/vault/image.js';
@@ -155,6 +155,18 @@ before(async () => {
     join(outside, 'source.png'), '--out', join(vault, 'photo.jpg'),
   ]);
 
+  // A JPEG whose dimensions sit past the first kilobyte, the way a photo with
+  // an embedded EXIF thumbnail does. The padding is an APP1 segment, which a
+  // decoder skips and a header parser has to walk over to reach the SOF.
+  const photo = await readFile(join(vault, 'photo.jpg'));
+  const padding = Buffer.alloc(4000);
+  padding.writeUInt16BE(0xffe1, 0);
+  padding.writeUInt16BE(padding.byteLength - 2, 2);
+  await writeFile(join(vault, 'padded.jpg'), Buffer.concat([photo.subarray(0, 2), padding, photo.subarray(2)]));
+
+  // A real TIFF, for the extension the write path used to refuse.
+  await run('/usr/bin/sips', ['-s', 'format', 'tiff', join(outside, 'source.png'), '--out', join(outside, 'scan.tif')]);
+
   // Frontmatter and canvas references, each the only use of its image.
   await writeFile(join(vault, 'covered.png'), png(8, 8));
   await writeFile(join(vault, 'boarded.png'), png(8, 8));
@@ -207,6 +219,155 @@ describe('merging with mcpvault', () => {
       assert.ok(!names.includes('write_image'), 'write_image is withheld');
     } finally {
       await harness.close();
+    }
+  });
+});
+
+describe('an upstream that goes away', () => {
+  /** A server that drops the link instead of answering, the way a crash would. */
+  function deserter(): Server {
+    const server = new Server({ name: 'deserter', version: '0' }, { capabilities: { tools: {} } });
+    server.setRequestHandler('tools/list', async () => {
+      await server.close();
+      // Never settles: the only way out is the transport closing.
+      return new Promise<never>(() => undefined);
+    });
+    return server;
+  }
+
+  /**
+   * Two calls: the first kills the link, the second is sent down a link that
+   * is already gone. The second is where `send` itself throws.
+   */
+  async function drive(): Promise<Record<string, any>[]> {
+    const merged = mergeTools(deserter, [], { name: 'portcall-test', version: '0' });
+    const [near, far] = InMemoryTransport.createLinkedPair();
+    const pending = new Map<number, (message: Record<string, any>) => void>();
+    near.onmessage = (message: any) => {
+      const settle = pending.get(message.id);
+      if (settle !== undefined) {
+        pending.delete(message.id);
+        settle(message);
+      }
+    };
+    await merged.connect(far);
+    await near.start();
+
+    let id = 0;
+    const rpc = (method: string, params: Record<string, unknown>): Promise<Record<string, any>> =>
+      new Promise((resolve) => {
+        id += 1;
+        pending.set(id, resolve);
+        void near.send({ jsonrpc: '2.0', id, method, params } as any);
+      });
+
+    await rpc('initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'test', version: '0' },
+    });
+    await near.send({ jsonrpc: '2.0', method: 'notifications/initialized' } as any);
+
+    const settled = async (): Promise<Record<string, any>> =>
+      Promise.race([
+        rpc('tools/list', {}),
+        new Promise<Record<string, any>>((resolve) => setTimeout(() => resolve({ hung: true }), 2000)),
+      ]);
+
+    const answers = [await settled(), await settled()];
+    await near.close().catch(() => undefined);
+    return answers;
+  }
+
+  test('a dropped link fails the call rather than hanging the request', async () => {
+    // Before this was handled the call sat in a Promise with no reject path,
+    // so the HTTP request behind it never answered at all.
+    for (const [index, answered] of (await drive()).entries()) {
+      assert.equal(answered['hung'], undefined, `call ${index + 1} came back instead of hanging`);
+      assert.notEqual(answered['error'], undefined, `call ${index + 1} came back as a failure`);
+    }
+  });
+
+  test('a transport failure never escapes as an unhandled rejection', async () => {
+    // `send` throws once the transport is closed, and the rejection used to be
+    // discarded with `void`. Node's default for an unhandled rejection is to
+    // exit, so that one line could take the daemon down with the request.
+    const escaped: unknown[] = [];
+    const watch = (error: unknown): void => {
+      escaped.push(error);
+    };
+    process.on('unhandledRejection', watch);
+    try {
+      await drive();
+      // Rejections surface on a later turn of the loop than the call itself.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    } finally {
+      process.off('unhandledRejection', watch);
+    }
+    assert.deepEqual(escaped, [], 'nothing reached the process-level handler');
+  });
+});
+
+describe('what a write leaves behind', () => {
+  test('a missing embed target stops the write instead of half-doing it', async () => {
+    // The image used to be written first, so the caller was told the embed
+    // failed and never told a file had appeared — and the corrected retry
+    // then hit "already exists" for a file it did not know it had made.
+    const scratch = await mkdtemp(join(tmpdir(), 'portcall-halfway-'));
+    const harness = await openHarness(scratch);
+    try {
+      const parts = await harness.call('write_image', {
+        path: 'shot.png',
+        data: png(4, 4).toString('base64'),
+        embedIn: 'no-such-note',
+      });
+      assert.match(parts.map((part) => part.text ?? '').join('\n'), /No note to embed into/);
+      await assert.rejects(() => access(join(scratch, 'shot.png')), 'nothing was left in the vault');
+    } finally {
+      await harness.close();
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test('a write leaves no staging file behind', async () => {
+    const scratch = await mkdtemp(join(tmpdir(), 'portcall-staging-'));
+    const harness = await openHarness(scratch);
+    try {
+      await harness.call('write_image', { path: 'shot.png', data: png(4, 4).toString('base64') });
+      const left = await readdir(scratch);
+      assert.deepEqual(left.filter((name) => name.endsWith('.tmp')), [], 'the file is renamed into place, not left aside');
+      assert.deepEqual(left, ['shot.png']);
+    } finally {
+      await harness.close();
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test('a TIFF may be saved as .tif, which is what a TIFF is called', async () => {
+    // `.tif` is in the set the vault stores, but the write check compared the
+    // sniffed format to one canonical spelling and refused the other.
+    const scratch = await mkdtemp(join(tmpdir(), 'portcall-tif-'));
+    const harness = await openHarness(scratch);
+    try {
+      const tiff = await readFile(join(outside, 'scan.tif'));
+      const parts = await harness.call('write_image', { path: 'scan.tif', data: tiff.toString('base64') });
+      assert.match(parts.map((part) => part.text ?? '').join('\n'), /Wrote scan\.tif/);
+      await access(join(scratch, 'scan.tif'));
+    } finally {
+      await harness.close();
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  test('bytes that do not match the extension are still refused', async () => {
+    const scratch = await mkdtemp(join(tmpdir(), 'portcall-mismatch-'));
+    const harness = await openHarness(scratch);
+    try {
+      const parts = await harness.call('write_image', { path: 'shot.jpg', data: png(4, 4).toString('base64') });
+      assert.match(parts.map((part) => part.text ?? '').join('\n'), /data is PNG but the path ends in \.jpg/);
+    } finally {
+      await harness.close();
+      await rm(scratch, { recursive: true, force: true });
     }
   });
 });
@@ -280,6 +441,22 @@ describe('read_image', () => {
 });
 
 describe('find_images', () => {
+  test('a JPEG whose size sits past the first kilobyte is still measured', async () => {
+    // A listing read 1024 bytes and gave up. A photo carrying an EXIF
+    // thumbnail keeps its SOF marker well past that, so those images were
+    // listed with no dimensions at all while read_image reported them fine.
+    const harness = await openHarness(vault);
+    try {
+      const listed = await harness.text('find_images', { query: 'padded' });
+      const row = JSON.parse(listed.slice(listed.indexOf('{'))).images[0];
+      assert.equal(row.path, 'padded.jpg');
+      assert.equal(row.width, 2400);
+      assert.equal(row.height, 1800);
+    } finally {
+      await harness.close();
+    }
+  });
+
   test('lists images with the notes that embed them', async () => {
     const harness = await openHarness(vault);
     try {

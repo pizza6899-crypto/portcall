@@ -233,7 +233,77 @@ const BOOK_FIELDS = {
   bdvl: 'totalBidSizeChange',
   advl: 'totalAskSizeChange',
   code: 'symbol',
+  // Percent change against `previousClose`, not a fifth set of prices. Checked
+  // against the live API: with base 337.0000, open 337.9050 comes back as
+  // ropen "+0.27" — (337.905 - 337) / 337, to two places. All four agree.
+  ropen: 'openPercent',
+  rhigh: 'highPercent',
+  rlow: 'lowPercent',
+  rclose: 'closePercent',
 } as const;
+
+/**
+ * Pre- and post-session indicative figures, in KIS's `output3`.
+ *
+ * `iep` and `iev` are the standard indicative equilibrium price and volume.
+ * The other five arrive blank whenever the venue is closed, which is the only
+ * state they could be observed in here, so they keep KIS's own names rather
+ * than being given invented ones.
+ */
+const BOOK_INDICATIVE_FIELDS = {
+  iep: 'indicativePrice',
+  iev: 'indicativeVolume',
+} as const;
+
+/** One rung of the ten-deep book. A side is omitted when it is not quoted. */
+interface BookLevel {
+  level: number;
+  bid?: string | undefined;
+  bidSize?: string | undefined;
+  bidChange?: string | undefined;
+  ask?: string | undefined;
+  askSize?: string | undefined;
+  askChange?: string | undefined;
+}
+
+function quoted(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  // A price of zero is KIS saying "nothing here", not a resting order at zero.
+  return trimmed === '' || Number(trimmed) === 0 ? undefined : trimmed;
+}
+
+function sized(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed === '' ? undefined : trimmed;
+}
+
+/**
+ * The ten-deep ladder KIS returns as flat `pbid1`…`dask10` keys.
+ *
+ * Outside session hours every rung comes back as a literal `0.0000` rather
+ * than being left out, and ten rows of zero read as a real book priced at
+ * zero. An unquoted rung is dropped instead, so an empty list means exactly
+ * what it says.
+ */
+function ladder(source: unknown): BookLevel[] {
+  if (typeof source !== 'object' || source === null) return [];
+  const row = source as Record<string, unknown>;
+
+  const levels: BookLevel[] = [];
+  for (let level = 1; level <= 10; level += 1) {
+    const bid = quoted(row[`pbid${level}`]);
+    const ask = quoted(row[`pask${level}`]);
+    if (bid === undefined && ask === undefined) continue;
+    levels.push({
+      level,
+      ...(bid === undefined ? {} : { bid, bidSize: sized(row[`vbid${level}`]), bidChange: sized(row[`dbid${level}`]) }),
+      ...(ask === undefined ? {} : { ask, askSize: sized(row[`vask${level}`]), askChange: sized(row[`dask${level}`]) }),
+    });
+  }
+  return levels;
+}
 
 const BALANCE_POSITION_FIELDS = {
   pdno: 'symbol',
@@ -386,6 +456,9 @@ const PNL_ROW_FIELDS = {
   ovrs_rlzt_pfls_amt: 'realizedPnl',
   pftrt: 'returnPercent',
   exrt: 'fxRate',
+  // Arrives on the row as well as on the period totals, and was the one key
+  // left untranslated in a payload where everything else had a plain name.
+  frst_bltn_exrt: 'firstQuotedFxRate',
   ovrs_excg_cd: 'exchange',
 } as const;
 
@@ -469,6 +542,51 @@ function lastObject(pages: Record<string, unknown>[], key: string, fields: Recor
     if (typeof source === 'object' && source !== null) return rename(source, fields);
   }
   return {};
+}
+
+/**
+ * Rows the chart endpoint returns in one call.
+ *
+ * Measured rather than documented: a request spanning nearly three years of
+ * daily bars comes back with exactly 100, and a five-week one with 34.
+ */
+const CHART_PAGE_ROWS = 100;
+
+/** The span a series of dated bars actually covers, against the span asked for. */
+interface Coverage {
+  covered?: { from: string; to: string };
+  truncated: boolean;
+}
+
+/**
+ * Work out whether KIS gave back the range that was requested.
+ *
+ * The chart endpoint caps a call at 100 rows and says nothing about having
+ * done so — a request for 2024-01-01 to 2026-09-20 comes back as the hundred
+ * most recent sessions, carrying the dates that were asked for. A reader then
+ * concludes the series begins in April 2026. There is no continuation cursor
+ * on this endpoint, so the honest move is to report what arrived and say how
+ * to ask for the rest.
+ */
+function coverage(bars: readonly Record<string, unknown>[], from: string): Coverage {
+  const dates = bars.map((bar) => bar['date']).filter((date): date is string => typeof date === 'string' && date !== '');
+  if (dates.length === 0) return { truncated: false };
+
+  const sorted = [...dates].sort();
+  const covered = { from: sorted[0]!, to: sorted.at(-1)! };
+
+  // A short series is KIS having nothing more, not KIS holding back. Only a
+  // full page that stops short of the requested start was actually capped.
+  // Comparing dates alone would flag nearly every call, because the first day
+  // of a range is rarely a trading day — a range from a Saturday starts on the
+  // Monday whether or not anything was cut.
+  return { covered, truncated: bars.length >= CHART_PAGE_ROWS && covered.from > from };
+}
+
+/** The sentence appended to a summary when the range came back short. */
+function shortfall(from: string, to: string, span: Coverage): string {
+  if (!span.truncated || span.covered === undefined) return '';
+  return ` — KIS capped this at ${span.covered.from}–${span.covered.to}; ${from}–${to} was asked for. Walk endDate backwards for the rest.`;
 }
 
 function result(summary: string, data: Record<string, unknown>) {
@@ -587,17 +705,28 @@ function registerQuotationTools(server: McpServer, client: KisClient): void {
     {
       title: 'Overseas order book',
       description:
-        'Best bid and ask for one overseas-listed stock, with total resting size on each side. Availability and depth vary by venue.',
+        'The bid and ask ladder for one overseas-listed stock: up to ten levels a side with price, resting size and change, plus the session summary and total size on each side. Levels come back only while the venue is quoting, so an empty `levels` outside trading hours is the real answer rather than a failure.',
       inputSchema: z.object({ exchange: quoteExchange, symbol }),
       annotations: READ_ONLY,
     },
     async ({ exchange, symbol: symb }) => {
       const body = await client.get(ENDPOINTS.askingPrice, { AUTH: '', EXCD: exchange, SYMB: symb });
-      const data = rename(body['output1'], BOOK_FIELDS);
-      return result(
-        `${symb} on ${exchange}: bid ${String(data['pbid1'] ?? '?')} / ask ${String(data['pask1'] ?? '?')}`,
-        data,
-      );
+      const levels = ladder(body['output2']);
+      const data: Record<string, unknown> = {
+        ...rename(body['output1'], BOOK_FIELDS),
+        levels,
+        indicative: rename(body['output3'], BOOK_INDICATIVE_FIELDS),
+      };
+
+      const best = levels[0];
+      const side = (price: string | undefined, size: string | undefined): string =>
+        price === undefined ? '—' : size === undefined ? price : `${price} × ${size}`;
+      const book =
+        best === undefined
+          ? 'no resting quotes (venue closed, or none at this depth)'
+          : `bid ${side(best.bid, best.bidSize)} / ask ${side(best.ask, best.askSize)}, ${levels.length} level${levels.length === 1 ? '' : 's'}`;
+
+      return result(`${symb} on ${exchange}: ${book}; last ${String(data['last'] ?? '?')}`, data);
     },
   );
 
@@ -606,7 +735,7 @@ function registerQuotationTools(server: McpServer, client: KisClient): void {
     {
       title: 'Overseas index',
       description:
-        'Daily, weekly, monthly or yearly history for a major overseas index, defaulting to the last 30 days. Only these four are served by this endpoint; individual constituents come from `overseas_daily_prices` instead.',
+        'Daily, weekly, monthly or yearly history for a major overseas index, defaulting to the last 30 days. KIS caps a call at 100 bars, so a longer range comes back short — `covered` says which dates actually arrived and `truncated` flags it. Only these four indices are served by this endpoint; individual constituents come from `overseas_daily_prices` instead.',
       inputSchema: z.object({
         index: z
           .enum(Object.keys(INDICES) as [string, ...string[]])
@@ -635,8 +764,12 @@ function registerQuotationTools(server: McpServer, client: KisClient): void {
       const bars = asRows(body['output2'], FX_ROW_FIELDS).filter((row) => row['date'] !== undefined && row['date'] !== '');
       const head = withDirection(rename(body['output1'], FX_HEAD_FIELDS));
       const label = INDICES[index as keyof typeof INDICES];
-      const data: Record<string, unknown> = { index, label, from, to, ...head, bars };
-      return result(`${label}: ${String(head['last'] ?? '?')}, ${bars.length} ${period} bars`, data);
+      const span = coverage(bars, from);
+      const data: Record<string, unknown> = { index, label, from, to, ...span, ...head, bars };
+      return result(
+        `${label}: ${String(head['last'] ?? '?')}, ${bars.length} ${period} bars${shortfall(from, to, span)}`,
+        data,
+      );
     },
   );
 
@@ -645,7 +778,7 @@ function registerQuotationTools(server: McpServer, client: KisClient): void {
     {
       title: 'Exchange rate',
       description:
-        'Daily, weekly, monthly or yearly exchange rate history for one currency against the US dollar, defaulting to the last 30 days. `quotedAs` says which way round the pair is read: most are units of the currency per dollar, but EUR, GBP and AUD are dollars per unit. Rates are KIS\u0027s published quotes, not the rate any particular transaction settled at — for that, the FX rate on a realised trade is in `overseas_realized_pnl`.',
+        'Daily, weekly, monthly or yearly exchange rate history for one currency against the US dollar, defaulting to the last 30 days. KIS caps a call at 100 bars, so a longer range comes back short — `covered` says which dates actually arrived and `truncated` flags it. `quotedAs` says which way round the pair is read: most are units of the currency per dollar, but EUR, GBP and AUD are dollars per unit. Rates are KIS\u0027s published quotes, not the rate any particular transaction settled at — for that, the FX rate on a realised trade is in `overseas_realized_pnl`.',
       inputSchema: z.object({
         currency: z
           .enum(Object.keys(CURRENCIES) as [string, ...string[]])
@@ -677,8 +810,12 @@ function registerQuotationTools(server: McpServer, client: KisClient): void {
       const bars = asRows(body['output2'], FX_ROW_FIELDS).filter((row) => row['date'] !== undefined && row['date'] !== '');
       const head = withDirection(rename(body['output1'], FX_HEAD_FIELDS));
       const quotedAs = pair.perUsd ? `${currency} per USD` : `USD per ${currency}`;
-      const data: Record<string, unknown> = { currency, quotedAs, from, to, ...head, bars };
-      return result(`${currency}: ${String(head['last'] ?? '?')} (${quotedAs}), ${bars.length} ${period} bars`, data);
+      const span = coverage(bars, from);
+      const data: Record<string, unknown> = { currency, quotedAs, from, to, ...span, ...head, bars };
+      return result(
+        `${currency}: ${String(head['last'] ?? '?')} (${quotedAs}), ${bars.length} ${period} bars${shortfall(from, to, span)}`,
+        data,
+      );
     },
   );
 }

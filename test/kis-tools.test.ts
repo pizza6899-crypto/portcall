@@ -122,6 +122,167 @@ describe('KIS date defaults', () => {
   });
 });
 
+/** A ten-deep book as KIS lays it out: flat `pbid1`…`dask10` keys on `output2`. */
+function book(levels: { bid?: string; bidSize?: string; ask?: string; askSize?: string }[]): Record<string, string> {
+  const flat: Record<string, string> = {};
+  for (let i = 1; i <= 10; i += 1) {
+    const level = levels[i - 1];
+    flat[`pbid${i}`] = level?.bid ?? '0.0000';
+    flat[`vbid${i}`] = level?.bidSize ?? '0';
+    flat[`dbid${i}`] = '0';
+    flat[`pask${i}`] = level?.ask ?? '0.0000';
+    flat[`vask${i}`] = level?.askSize ?? '0';
+    flat[`dask${i}`] = '0';
+  }
+  return flat;
+}
+
+describe('the order book', () => {
+  test('the ladder KIS puts in output2 actually comes back', async () => {
+    // The bug this pins: the tool renamed `output1` only, so the ten levels
+    // were dropped and the summary read `bid ? / ask ?` on every call.
+    const tools = await openTools({
+      rt_cd: '0',
+      output1: { last: '336.13', base: '337.0000' },
+      output2: book([
+        { bid: '336.10', bidSize: '200', ask: '336.20', askSize: '150' },
+        { bid: '336.05', bidSize: '400', ask: '336.25', askSize: '300' },
+      ]),
+      output3: {},
+    });
+    try {
+      const response = await tools.call('overseas_orderbook', { exchange: 'NAS', symbol: 'AAPL' });
+      const data = response['result'].structuredContent;
+
+      assert.equal(data.levels.length, 2, 'both quoted levels are returned');
+      assert.deepEqual(data.levels[0], {
+        level: 1,
+        bid: '336.10',
+        bidSize: '200',
+        bidChange: '0',
+        ask: '336.20',
+        askSize: '150',
+        askChange: '0',
+      });
+      assert.match(response['result'].content[0].text as string, /bid 336\.10 × 200 \/ ask 336\.20 × 150/);
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('a closed venue reads as an empty book, not as a book priced at zero', async () => {
+    // KIS pads every rung with 0.0000 outside session hours rather than
+    // omitting them, which would otherwise render as ten real orders at zero.
+    const tools = await openTools({ rt_cd: '0', output1: { last: '336.13' }, output2: book([]), output3: {} });
+    try {
+      const response = await tools.call('overseas_orderbook', { exchange: 'NAS', symbol: 'AAPL' });
+      assert.deepEqual(response['result'].structuredContent.levels, []);
+      assert.match(response['result'].content[0].text as string, /no resting quotes/);
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('one side quoting on its own keeps its rung', async () => {
+    const tools = await openTools({
+      rt_cd: '0',
+      output1: {},
+      output2: book([{ ask: '336.20', askSize: '150' }]),
+      output3: {},
+    });
+    try {
+      const data = (await tools.call('overseas_orderbook', { exchange: 'NAS', symbol: 'AAPL' }))['result']
+        .structuredContent;
+      assert.equal(data.levels.length, 1);
+      assert.equal(data.levels[0].ask, '336.20');
+      assert.equal('bid' in data.levels[0], false, 'an unquoted side is left out rather than sent as zero');
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('the r-prefixed fields are labelled as percentages, because that is what they are', async () => {
+    // base 337.0000 with open 337.9050 arrives as ropen "+0.27" on the live
+    // API — a change against the previous close, not a fifth set of prices.
+    const tools = await openTools({
+      rt_cd: '0',
+      output1: { base: '337.0000', open: '337.9050', ropen: '+0.27', rhigh: '+0.44', rlow: '-1.33', rclose: '-0.26' },
+      output2: book([]),
+      output3: {},
+    });
+    try {
+      const data = (await tools.call('overseas_orderbook', { exchange: 'NAS', symbol: 'AAPL' }))['result']
+        .structuredContent;
+      assert.equal(data.openPercent, '+0.27');
+      assert.equal(data.closePercent, '-0.26');
+      assert.equal(data.open, '337.9050', 'the price itself is still the price');
+      assert.equal('ropen' in data, false, 'nothing is left under its KIS abbreviation');
+    } finally {
+      await tools.close();
+    }
+  });
+});
+
+describe('a chart range KIS will not serve in full', () => {
+  /** `count` sessions of padding, newest first, ending on the given date. */
+  function series(count: number, endDate: string): Record<string, string>[] {
+    const end = new Date(`${endDate.slice(0, 4)}-${endDate.slice(4, 6)}-${endDate.slice(6)}T00:00:00Z`);
+    return [...Array(count)].map((_, i) => {
+      const day = new Date(end.getTime() - i * 86_400_000);
+      return { stck_bsop_date: day.toISOString().slice(0, 10).replaceAll('-', ''), ovrs_nmix_prpr: '1390.0' };
+    });
+  }
+
+  test('a range that came back short says so instead of implying it is complete', async () => {
+    // The endpoint caps a call at 100 rows and echoes the requested dates, so
+    // a three-year ask used to read as a three-year answer.
+    const tools = await openTools({ rt_cd: '0', output1: {}, output2: series(100, '20260918') });
+    try {
+      const response = await tools.call('fx_rate', {
+        currency: 'KRW',
+        startDate: '20240101',
+        endDate: '20260920',
+      });
+      const data = response['result'].structuredContent;
+
+      assert.equal(data.truncated, true);
+      assert.equal(data.covered.to, '20260918');
+      assert.equal(data.covered.from, '20260611', 'the oldest row that actually arrived');
+      assert.equal(data.from, '20240101', 'what was asked for is still reported, as what was asked for');
+      assert.match(response['result'].content[0].text as string, /KIS capped this at 20260611–20260918/);
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('a range that fits is not flagged', async () => {
+    const tools = await openTools({ rt_cd: '0', output1: {}, output2: series(34, '20260918') });
+    try {
+      const response = await tools.call('fx_rate', {
+        currency: 'KRW',
+        startDate: '20260801',
+        endDate: '20260920',
+      });
+      assert.equal(response['result'].structuredContent.truncated, false);
+      assert.doesNotMatch(response['result'].content[0].text as string, /capped/);
+    } finally {
+      await tools.close();
+    }
+  });
+
+  test('the index tool reports its coverage the same way', async () => {
+    const tools = await openTools({ rt_cd: '0', output1: {}, output2: series(100, '20260918') });
+    try {
+      const data = (await tools.call('overseas_index', { index: 'SPX', startDate: '20200101' }))['result']
+        .structuredContent;
+      assert.equal(data.truncated, true);
+      assert.equal(data.covered.from, '20260611');
+    } finally {
+      await tools.close();
+    }
+  });
+});
+
 describe('what the KIS mount exposes', () => {
   test('ten tools, every one of them read-only', async () => {
     const tools = await openTools();

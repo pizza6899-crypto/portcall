@@ -283,6 +283,9 @@ export function sniffFormat(bytes: Buffer): string | undefined {
     return 'webp';
   }
   if (bytes.length >= 2 && bytes.subarray(0, 2).toString('latin1') === 'BM') return 'bmp';
+  // `00 00 01 00` then a non-zero image count. The count keeps four leading
+  // zero-ish bytes in some other format from reading as an icon.
+  if (bytes.length >= 6 && bytes.readUInt32LE(0) === 0x0001_0000 && bytes.readUInt16LE(4) > 0) return 'ico';
   if (bytes.length >= 4) {
     const order = bytes.subarray(0, 4);
     if (order.equals(Buffer.from([0x49, 0x49, 0x2a, 0x00])) || order.equals(Buffer.from([0x4d, 0x4d, 0x00, 0x2a]))) {
@@ -294,7 +297,34 @@ export function sniffFormat(bytes: Buffer): string | undefined {
   return undefined;
 }
 
-/** The extension that belongs to a sniffed format, for reporting a mismatch. */
+/**
+ * Extensions that may legitimately hold each format.
+ *
+ * The bytes are checked against the name, so the check has to know the
+ * aliases. `.tif` and `.tiff` are one format, so are `.heic` and `.heif`, and
+ * so are `.jpg` and `.jpeg` — refusing one of each pair turns a correct file
+ * into an error and tells the caller to rename it to something no less
+ * correct.
+ */
+const FORMAT_EXTENSIONS: Record<string, readonly string[]> = {
+  jpeg: ['jpg', 'jpeg'],
+  png: ['png'],
+  gif: ['gif'],
+  webp: ['webp'],
+  bmp: ['bmp'],
+  tiff: ['tif', 'tiff'],
+  heic: ['heic', 'heif'],
+  avif: ['avif'],
+  ico: ['ico'],
+  svg: ['svg'],
+};
+
+/** Whether a path's extension is one this format is allowed to be stored under. */
+export function extensionMatchesFormat(extension: string, format: string): boolean {
+  return (FORMAT_EXTENSIONS[format] ?? [format]).includes(extension);
+}
+
+/** The extension to suggest for a sniffed format, for reporting a mismatch. */
 export function canonicalExtension(format: string): string {
-  return format === 'jpeg' ? 'jpg' : format;
+  return FORMAT_EXTENSIONS[format]?.[0] ?? format;
 }

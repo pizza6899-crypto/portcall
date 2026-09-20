@@ -173,7 +173,8 @@ A read-only mount serves `read_image` and `find_images`, and withholds
 ### KIS
 
 Quotation tools, which need no account: `overseas_quote`,
-`overseas_quote_detail`, `overseas_daily_prices`, `overseas_orderbook`, `fx_rate` (exchange rate
+`overseas_quote_detail`, `overseas_daily_prices`, `overseas_orderbook` (ten
+levels a side, with the session summary), `fx_rate` (exchange rate
 history for 14 currencies against the dollar) and `overseas_index` (Dow,
 Nasdaq Composite, Nasdaq 100, S&P 500).
 
@@ -206,6 +207,15 @@ into a single request.
 Account queries are paged: KIS signals more rows with `tr_cont` of `F` or `M`
 and expects the next request to echo the cursor from the previous body. The
 client walks that automatically, up to a page ceiling.
+
+The chart endpoint behind `fx_rate` and `overseas_index` has no such cursor,
+and caps a call at 100 rows without saying so: a request for three years of
+daily bars comes back as the most recent hundred sessions, carrying the dates
+that were asked for. Read as-is that says the series begins in April. Both
+tools therefore report `covered` — the span the rows actually span — and set
+`truncated` when a full page stopped short of the requested start. A short
+page is KIS having nothing more, not KIS holding back, so only a full one is
+flagged.
 
 The won/foreign-currency flag is not consistent across KIS endpoints: the
 consolidated balance reads `01` as won, while the realised P&L endpoint reads
@@ -263,6 +273,7 @@ All host-specific values come from the environment.
 | `PORTCALL_GUARD_BLOCK_MS` | `900000` | How long a blocked client stays blocked |
 | `PORTCALL_GUARD_RATE` | `600` | Requests per client per window; `0` disables |
 | `PORTCALL_GUARD_RATE_WINDOW_MS` | `60000` | The rate window |
+| `PORTCALL_LOG_HEADERS` | `false` | Log every request header, with anything unrecognised reduced to a sketch |
 | `KIS_APP_KEY` | *(unset)* | Korea Investment app key. Unset leaves the KIS mount off entirely |
 | `KIS_APP_SECRET` | *(required with the key)* | App secret paired with `KIS_APP_KEY` |
 | `KIS_ACCOUNT` | *(unset)* | Account number, `12345678-01`. Unset serves quotations only |
@@ -291,6 +302,20 @@ Treat a path prefix as weaker than a header. URLs reach proxy access logs,
 crash reports, and anything that records a destination, and a leaked one grants
 the same access a leaked token would. It raises the bar — it is not
 authentication.
+
+This log is the one destination the process does control, so the prefix is
+reduced there the same way a token is: request lines and the startup banner
+read `/<prefix a1b2c3d4>/vault/mcp`, which still says which mount was hit. A
+path that does not carry the prefix is logged as it came, because that is the
+caller's guess rather than the secret.
+
+`PORTCALL_LOG_HEADERS=true` writes out every header a request carried, for
+bringing up a new client. What it prints is an allowlist: the ordinary
+addressing and content headers in the clear, `Authorization` as its scheme
+plus a length and digest, and everything else as a length and digest alone.
+Deciding what to print rather than what to hide is deliberate — a blacklist of
+key names only catches the secrets someone thought of, and the one that got
+out of this project was stored under the key `value`.
 
 Which plugins are mounted, and where, is declared in `plugins.config.ts`.
 
@@ -366,9 +391,12 @@ test/
   auth.test.ts         bearer token check
   kis-token.test.ts    token caching, single-flight, restart reload
   kis-client.test.ts   allowlist, headers, paging, KIS error surfacing
-  kis-tools.test.ts    the tool set, read-only hints, Korean business dates
-  vault-media.test.ts  header parsing, format sniffing, reference extraction
-  vault-image.test.ts  the image tools, driven through the merged server
+  kis-tools.test.ts    the tool set, read-only hints, Korean business dates,
+                       the order book ladder, chart-range coverage
+  vault-media.test.ts  header parsing, format sniffing, reference extraction,
+                       extension aliases, the private-address filter, download caps
+  vault-image.test.ts  the image tools, driven through the merged server,
+                       plus what survives an upstream that goes away
   helpers.ts           server harness and MCP request builders
 ```
 

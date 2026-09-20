@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 
 import {
   canonicalExtension,
+  extensionMatchesFormat,
   extensionOf,
   isImagePath,
   mimeTypeOf,
   parseDimensions,
   sniffFormat,
 } from '../src/plugins/vault/media.js';
+import { drain, isPrivateAddress } from '../src/plugins/vault/image.js';
 import { canvasRefs, frontmatterRefs, insideVault, parseEmbeds, resolveTarget } from '../src/plugins/vault/paths.js';
 
 function pngHeader(width: number, height: number): Buffer {
@@ -214,5 +216,119 @@ describe('canvas references', () => {
     assert.deepEqual(canvasRefs('not json at all'), []);
     assert.deepEqual(canvasRefs('{"nodes":"wrong shape"}'), []);
     assert.deepEqual(canvasRefs('{}'), []);
+  });
+});
+
+describe('an extension that is an alias, not a mismatch', () => {
+  test('every extension the vault accepts can also be written', () => {
+    // `isImagePath` lets these into the vault, so refusing them on the way in
+    // rejects a correct file and asks for a rename to something no better.
+    for (const [extension, format] of [
+      ['jpg', 'jpeg'],
+      ['jpeg', 'jpeg'],
+      ['tif', 'tiff'],
+      ['tiff', 'tiff'],
+      ['heic', 'heic'],
+      ['heif', 'heic'],
+      ['png', 'png'],
+      ['gif', 'gif'],
+      ['webp', 'webp'],
+      ['bmp', 'bmp'],
+      ['avif', 'avif'],
+      ['ico', 'ico'],
+      ['svg', 'svg'],
+    ] as const) {
+      assert.ok(isImagePath(`x.${extension}`), `.${extension} is stored in the vault`);
+      assert.ok(extensionMatchesFormat(extension, format), `.${extension} must be allowed to hold ${format}`);
+    }
+  });
+
+  test('a genuine mismatch is still refused, and names the right extension', () => {
+    assert.equal(extensionMatchesFormat('png', 'jpeg'), false);
+    assert.equal(extensionMatchesFormat('tif', 'png'), false);
+    assert.equal(canonicalExtension('tiff'), 'tif');
+    assert.equal(canonicalExtension('jpeg'), 'jpg');
+  });
+
+  test('an icon is recognised at all', () => {
+    // Without this, `.ico` was a path the vault accepted and nothing could
+    // ever be written to, because the bytes sniffed as no format.
+    const ico = Buffer.alloc(22);
+    ico.writeUInt16LE(0, 0);
+    ico.writeUInt16LE(1, 2); // type: icon
+    ico.writeUInt16LE(1, 4); // one image
+    assert.equal(sniffFormat(ico), 'ico');
+
+    const notAnIcon = Buffer.alloc(22); // the image count stays zero
+    assert.equal(sniffFormat(notAnIcon), undefined);
+  });
+});
+
+describe('addresses a URL import must not reach', () => {
+  test('the ordinary private ranges', () => {
+    for (const address of ['127.0.0.1', '10.1.2.3', '192.168.1.1', '172.16.0.1', '169.254.169.254', '::1', 'fd00::1']) {
+      assert.equal(isPrivateAddress(address), true, `${address} is private`);
+    }
+  });
+
+  test('an IPv4 destination wearing IPv6 notation', () => {
+    // A host controls its own AAAA record, so this is a bypass it can simply
+    // publish. Both spellings resolve to the same place.
+    assert.equal(isPrivateAddress('::ffff:127.0.0.1'), true);
+    assert.equal(isPrivateAddress('::ffff:10.0.0.5'), true);
+    assert.equal(isPrivateAddress('::ffff:7f00:1'), true, 'the hex spelling of 127.0.0.1');
+    assert.equal(isPrivateAddress('::ffff:a00:5'), true, 'the hex spelling of 10.0.0.5');
+  });
+
+  test('carrier-grade NAT, where a mesh VPN puts its peers', () => {
+    assert.equal(isPrivateAddress('100.64.0.1'), true);
+    assert.equal(isPrivateAddress('100.100.100.100'), true);
+    assert.equal(isPrivateAddress('100.128.0.1'), false, 'just outside the /10 is ordinary public space');
+  });
+
+  test('a public address is still reachable', () => {
+    for (const address of ['8.8.8.8', '1.1.1.1', '93.184.216.34', '2606:4700::1111']) {
+      assert.equal(isPrivateAddress(address), false, `${address} is public`);
+    }
+  });
+
+  test('something unparseable is refused rather than allowed', () => {
+    for (const address of ['', 'not-an-address', '10.0.0', '1.2.3.4.5', '300.1.1.1']) {
+      assert.equal(isPrivateAddress(address), true, `${address} cannot be reasoned about`);
+    }
+  });
+});
+
+describe('a download that will not fit', () => {
+  /** A body that keeps producing until it is cancelled. */
+  function endless(chunkBytes: number): Response {
+    let produced = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        produced += chunkBytes;
+        // Far past any ceiling: if the cap only applied after buffering, this
+        // test would sit here allocating until it fell over.
+        if (produced > 4_000_000_000) controller.close();
+        else controller.enqueue(new Uint8Array(chunkBytes));
+      },
+    });
+    return new Response(stream, { headers: { 'content-type': 'image/png' } });
+  }
+
+  test('an oversized body is cut off while it streams, not after', async () => {
+    await assert.rejects(() => drain(endless(1_000_000)), /larger than/);
+  });
+
+  test('a declared length over the limit is refused on the header alone', async () => {
+    // The body here is a few bytes. Only the `content-length` can have
+    // produced this refusal, which is the point: the free check runs first
+    // and a huge download is turned away before it is pulled.
+    const response = new Response(Buffer.from('tiny'), { headers: { 'content-length': '900000000' } });
+    await assert.rejects(() => drain(response), /declares 900000000 bytes/);
+  });
+
+  test('a body within the limit comes back whole', async () => {
+    const body = Buffer.from('a small image, notionally');
+    assert.deepEqual(await drain(new Response(body)), body);
   });
 });
