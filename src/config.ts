@@ -71,6 +71,23 @@ export const config = {
   modernOnly: boolean('PORTCALL_MODERN_ONLY', false),
 
   /**
+   * Failed authentications from one client within `guardWindowMs` before it is
+   * blocked. `0` disables the lockout.
+   *
+   * Cloudflare can cap request volume, but only this process knows whether a
+   * token was right, so credential guessing is caught here rather than at the
+   * edge.
+   */
+  guardFailureLimit: integer('PORTCALL_GUARD_FAILURES', 5),
+  /** How far back failures are counted. */
+  guardWindowMs: integer('PORTCALL_GUARD_WINDOW_MS', 5 * 60_000),
+  /** How long a blocked client stays blocked. */
+  guardBlockMs: integer('PORTCALL_GUARD_BLOCK_MS', 15 * 60_000),
+  /** Requests per client per `guardRateWindowMs`. `0` disables the cap. */
+  guardRateLimit: integer('PORTCALL_GUARD_RATE', 600),
+  guardRateWindowMs: integer('PORTCALL_GUARD_RATE_WINDOW_MS', 60_000),
+
+  /**
    * Log every request header, with sensitive values reduced to a digest.
    *
    * Off by default: it is a diagnostic for bringing up a new client, not

@@ -312,3 +312,76 @@ describe('the KIS plugin', () => {
     );
   });
 });
+
+describe('abuse control', () => {
+  const token = 'guard-test-token-value';
+
+  test('repeated wrong tokens get the client blocked, and the block covers every path', async () => {
+    const server = await startServer({ PORTCALL_TOKEN: token, PORTCALL_GUARD_FAILURES: '3' });
+    try {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const res = await modernRequest(server.baseUrl, '/vault/mcp', 'tools/list', {}, {
+          authorization: 'Bearer wrong-token-value',
+        });
+        assert.equal(res.status, 401, `attempt ${attempt} should still be a plain rejection`);
+      }
+
+      // The fourth try never reaches the token check.
+      const blocked = await modernRequest(server.baseUrl, '/vault/mcp', 'tools/list', {}, {
+        authorization: 'Bearer wrong-token-value',
+      });
+      assert.equal(blocked.status, 429);
+      assert.ok(Number(blocked.headers.get('retry-after')) > 0, 'a blocked client is told when to return');
+
+      // Holding the real token does not help once blocked, and neither does
+      // switching to an endpoint that needs none.
+      const withToken = await modernRequest(server.baseUrl, '/vault/mcp', 'tools/list', {}, {
+        authorization: `Bearer ${token}`,
+      });
+      assert.equal(withToken.status, 429);
+      assert.equal((await fetch(`${server.baseUrl}/healthz`)).status, 429);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('a caller holding the token is not locked out by earlier stray failures', async () => {
+    const server = await startServer({ PORTCALL_TOKEN: token, PORTCALL_GUARD_FAILURES: '3' });
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        await modernRequest(server.baseUrl, '/vault/mcp', 'tools/list', {}, { authorization: 'Bearer nope' });
+      }
+
+      const ok = await modernRequest(server.baseUrl, '/vault/mcp', 'tools/list', {}, {
+        authorization: `Bearer ${token}`,
+      });
+      assert.equal(ok.status, 200);
+
+      // The success cleared the history, so two more failures still do not trip it.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const res = await modernRequest(server.baseUrl, '/vault/mcp', 'tools/list', {}, { authorization: 'Bearer nope' });
+        assert.equal(res.status, 401);
+      }
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('the rate cap refuses a flood without a token being involved', async () => {
+    const server = await startServer({ PORTCALL_GUARD_RATE: '5', PORTCALL_GUARD_RATE_WINDOW_MS: '60000' });
+    try {
+      const codes: number[] = [];
+      for (let i = 0; i < 8; i += 1) codes.push((await fetch(`${server.baseUrl}/healthz`)).status);
+
+      // The harness already spent part of the budget waiting for the server to
+      // come up, so what matters is the shape: served until the cap, refused
+      // after it, and never served again inside the window.
+      assert.equal(codes[0], 200, 'the first call must be served');
+      assert.ok(codes.includes(429), 'the cap must engage within eight calls');
+      const firstRefusal = codes.indexOf(429);
+      assert.deepEqual(codes.slice(firstRefusal), codes.slice(firstRefusal).map(() => 429));
+    } finally {
+      await server.stop();
+    }
+  });
+});

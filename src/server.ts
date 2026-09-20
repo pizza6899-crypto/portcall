@@ -7,11 +7,28 @@ import type { NodeIncomingMessageLike, NodeMcpRequestHandler } from '@modelconte
 import { plugins } from '../plugins.config.js';
 import { isAuthorized } from './auth.js';
 import { config } from './config.js';
+import { clientAddress, createGuard, isLoopback } from './guard.js';
 import { describeHeaders, digest, log } from './log.js';
 import { detailedHealthRoute, resolveMounts, routeKey } from './routes.js';
 import type { Plugin } from './types.js';
 
 const startedAt = Date.now();
+
+const guard = createGuard({
+  failureLimit: config.guardFailureLimit,
+  windowMs: config.guardWindowMs,
+  blockMs: config.guardBlockMs,
+  rateLimit: config.guardRateLimit,
+  rateWindowMs: config.guardRateWindowMs,
+});
+
+/**
+ * Only a loopback listener can vouch for `cf-connecting-ip`: nothing but the
+ * local tunnel can deliver a request, so nothing else can forge the header.
+ * Bound to a public interface the header is attacker-controlled, and trusting
+ * it would let one client be blocked in another's name.
+ */
+const trustProxyHeader = isLoopback(config.host);
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
@@ -57,6 +74,17 @@ const healthRoute = detailedHealthRoute(config.pathPrefix);
 
 const httpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) => {
   const pathname = routeKey(req.url);
+  const client = clientAddress(req.headers, req.socket.remoteAddress, trustProxyHeader);
+  const now = Date.now();
+
+  const verdict = guard.check(client, now);
+  if (!verdict.allowed) {
+    // Says nothing about what is here, or about why the caller is unwelcome.
+    res.setHeader('retry-after', String(verdict.retryAfterSeconds));
+    json(res, 429, { error: 'too_many_requests' });
+    return;
+  }
+
   log.info('request', {
     method: req.method,
     pathname,
@@ -94,15 +122,24 @@ const httpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) 
   }
 
   if (!isAuthorized(req.headers.authorization, config.token)) {
-    // Naming the digest the server expected turns "wrong token" and "no token
-    // at all" into two distinguishable failures from the log alone.
-    if (config.logHeaders && config.token !== undefined) {
-      log.warn('rejected', { pathname, expectedToken: digest(config.token) });
-    }
+    const blocked = guard.recordFailure(client, now);
+
+    // Always logged, not only under the header diagnostic: a rejection is the
+    // one event that says someone is guessing, and it is worthless if it only
+    // shows up when the operator already suspected something.
+    log.warn('rejected', {
+      pathname,
+      client,
+      ...(config.token === undefined ? {} : { expectedToken: digest(config.token) }),
+      ...(blocked ? { blockedForSeconds: Math.round(config.guardBlockMs / 1000) } : {}),
+    });
+
     res.setHeader('www-authenticate', 'Bearer');
     json(res, 401, { error: 'unauthorized' });
     return;
   }
+
+  guard.recordSuccess(client);
 
   // `IncomingMessage` declares `method`/`url` as `string | undefined`, which the
   // adapter's duck type rejects under `exactOptionalPropertyTypes`. The shapes are
@@ -122,6 +159,8 @@ httpServer.listen(config.port, config.host, () => {
     address: `http://${config.host}:${config.port}`,
     mounts: [...routes.keys()],
     authRequired: config.token !== undefined,
+    guard: `${config.guardFailureLimit} failures / ${Math.round(config.guardWindowMs / 1000)}s → block ${Math.round(config.guardBlockMs / 1000)}s; ${config.guardRateLimit} req / ${Math.round(config.guardRateWindowMs / 1000)}s`,
+    trustProxyHeader,
   });
 });
 

@@ -57,6 +57,31 @@ and skips stdio entirely.
 The SDK builds a fresh server instance per request and disposes it with the
 request, so there is no session state to time out and no accumulating handles.
 
+## Abuse control
+
+A client that fails authentication `PORTCALL_GUARD_FAILURES` times inside the
+window is blocked for `PORTCALL_GUARD_BLOCK_MS`, on every path, whatever token
+it presents afterwards. A separate cap refuses more than `PORTCALL_GUARD_RATE`
+requests per client per window. Rejections always reach the log, with the
+client and — when a block trips — how long it lasts.
+
+This belongs here rather than at the CDN because only this process knows
+whether a token was *right*. Five wrong tokens is a far sharper signal than
+five hundred requests, and an edge rate limit cannot tell them apart. An edge
+limit is still the better answer to a volumetric flood, which this cannot
+help with: by the time the request is counted here it has already crossed the
+link. The two do not overlap.
+
+Clients are told apart by `cf-connecting-ip`, which is trustworthy only
+because the listener is bound to loopback — nothing but the local tunnel can
+deliver a request, so nothing else can forge the header. Bound to a public
+interface the header is ignored and the socket address is used instead;
+believing it there would let one caller be blocked under another's address.
+
+State is in memory and dies with the process, so a restart forgives everyone.
+That is deliberate: the worst outcome for a personal gateway is locking out
+its owner.
+
 ## Plugins
 
 | Mount | Serves |
@@ -142,6 +167,11 @@ All host-specific values come from the environment.
 | `PORTCALL_PATH_PREFIX` | *(unset)* | Serve every mount under `/<prefix>/…` |
 | `PORTCALL_KEEPALIVE_MS` | `15000` | SSE keepalive interval; `0` disables |
 | `PORTCALL_MODERN_ONLY` | `false` | Reject 2025-era requests instead of serving them |
+| `PORTCALL_GUARD_FAILURES` | `5` | Auth failures from one client before it is blocked; `0` disables |
+| `PORTCALL_GUARD_WINDOW_MS` | `300000` | How far back those failures are counted |
+| `PORTCALL_GUARD_BLOCK_MS` | `900000` | How long a blocked client stays blocked |
+| `PORTCALL_GUARD_RATE` | `600` | Requests per client per window; `0` disables |
+| `PORTCALL_GUARD_RATE_WINDOW_MS` | `60000` | The rate window |
 | `KIS_APP_KEY` | *(unset)* | Korea Investment app key. Unset leaves the KIS mount off entirely |
 | `KIS_APP_SECRET` | *(required with the key)* | App secret paired with `KIS_APP_KEY` |
 | `KIS_ACCOUNT` | *(unset)* | Account number, `12345678-01`. Unset serves quotations only |
