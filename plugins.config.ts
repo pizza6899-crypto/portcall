@@ -4,9 +4,12 @@
  * Host-specific values (vault paths, ports, tokens) come from the environment
  * so this file stays safe to commit.
  */
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
 import { optional, required } from './src/config.js';
 import { kisPlugin } from './src/plugins/kis/index.js';
-import { vaultPlugin } from './src/plugins/vault.js';
+import { vaultPlugin } from './src/plugins/vault/index.js';
 import type { Plugin } from './src/types.js';
 
 /**
@@ -34,10 +37,27 @@ function kisAccount(): { cano: string; productCode: string } | undefined {
   return { cano: match[1]!, productCode: match[2]! };
 }
 
+/**
+ * Folders `write_image` may copy a local file from, colon-separated, with a
+ * leading `~/` expanded. Unset means none: the vault mount otherwise reads
+ * nothing outside the vault, and importing is the one thing that would
+ * change that, so it is opted into per host.
+ */
+function vaultImportRoots(): string[] {
+  const raw = optional('PORTCALL_VAULT_IMPORT_DIRS');
+  if (raw === undefined) return [];
+  return raw
+    .split(':')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== '')
+    .map((entry) => (entry.startsWith('~/') ? join(homedir(), entry.slice(2)) : entry));
+}
+
 export const plugins: Plugin[] = [
   vaultPlugin({
     vaultPath: required('PORTCALL_VAULT_PATH'),
     path: 'vault',
+    importRoots: vaultImportRoots(),
   }),
   ...(kisAppKey === undefined
     ? []

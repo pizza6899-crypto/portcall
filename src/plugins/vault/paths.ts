@@ -1,0 +1,108 @@
+import { readdir } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+
+/**
+ * Directories that hold no user attachments.
+ *
+ * `.obsidian` is configuration, `.trash` is Obsidian's own recycle bin, and a
+ * file in either would show up as an orphan every time.
+ */
+const SKIPPED_DIRECTORIES = new Set(['.git', '.obsidian', '.trash', 'node_modules']);
+
+/**
+ * Resolve a vault-relative path, refusing anything that leaves the vault.
+ *
+ * Absolute inputs and `..` segments both land outside, so both are rejected —
+ * the mount serves one directory and nothing above it.
+ */
+export function insideVault(vaultPath: string, candidate: string): string {
+  const root = resolve(vaultPath);
+  const full = resolve(root, candidate);
+  const rel = relative(root, full);
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+    throw new Error(`Path escapes the vault: ${candidate}`);
+  }
+  return full;
+}
+
+/** Every file in the vault, as paths relative to its root, in directory order. */
+export async function walkVault(vaultPath: string): Promise<string[]> {
+  const root = resolve(vaultPath);
+  const found: string[] = [];
+
+  async function descend(directory: string, prefix: string): Promise<void> {
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') && !entry.isDirectory()) continue;
+      const rel = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+      if (entry.isDirectory()) {
+        if (SKIPPED_DIRECTORIES.has(entry.name)) continue;
+        await descend(join(directory, entry.name), rel);
+      } else if (entry.isFile()) {
+        found.push(rel);
+      }
+    }
+  }
+
+  await descend(root, '');
+  return found;
+}
+
+/**
+ * Targets of the image embeds in one note.
+ *
+ * Both Obsidian syntaxes count: `![[attachment.png]]` and `![alt](path.png)`.
+ * Remote and inline sources are skipped — there is no vault file behind them.
+ */
+export function parseEmbeds(markdown: string): string[] {
+  const targets: string[] = [];
+
+  for (const match of markdown.matchAll(/!\[\[([^\]]+)\]\]/g)) {
+    // `target|alias` and `target#heading` both narrow a link to the same file.
+    const target = match[1]!.split('|')[0]!.split('#')[0]!.trim();
+    if (target !== '') targets.push(target);
+  }
+
+  for (const match of markdown.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)) {
+    // A title after the path (`(path "title")`) is not part of it.
+    const raw = match[1]!.trim().split(/\s+/)[0]!;
+    if (raw === '' || /^[a-z][a-z0-9+.-]*:/i.test(raw) || raw.startsWith('#')) continue;
+    targets.push(decodeUriComponentSafely(raw));
+  }
+
+  return targets;
+}
+
+function decodeUriComponentSafely(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    // A stray `%` is a literal in Obsidian, not a broken escape.
+    return value;
+  }
+}
+
+/**
+ * Resolve an embed target the way Obsidian does.
+ *
+ * A target containing a slash is a path from the vault root. A bare filename
+ * is matched against every basename in the vault, which is why an ambiguous
+ * one has to be reported rather than guessed at.
+ */
+export function resolveTarget(target: string, files: readonly string[]): string[] {
+  const normalised = target.replace(/^\.\//, '');
+  if (files.includes(normalised)) return [normalised];
+
+  if (normalised.includes('/')) {
+    const suffix = `/${normalised.toLowerCase()}`;
+    return files.filter((file) => file.toLowerCase().endsWith(suffix));
+  }
+
+  const wanted = normalised.toLowerCase();
+  return files.filter((file) => basename(file).toLowerCase() === wanted);
+}
+
+function basename(path: string): string {
+  const cut = path.lastIndexOf('/');
+  return cut === -1 ? path : path.slice(cut + 1);
+}

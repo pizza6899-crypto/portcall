@@ -86,8 +86,53 @@ its owner.
 
 | Mount | Serves |
 |---|---|
-| `/vault/mcp` | `@bitbonsai/mcpvault` over the Obsidian vault at `PORTCALL_VAULT_PATH` |
+| `/vault/mcp` | `@bitbonsai/mcpvault` over the Obsidian vault at `PORTCALL_VAULT_PATH`, plus image tools |
 | `/kis/mcp` | Korea Investment & Securities overseas-stock quotations, read-only |
+
+### Vault images
+
+mcpvault reads and writes notes but has nothing for attachments, so an
+embedded screenshot arrives as the literal text `![[shot.png]]` and the image
+itself is unreachable. Three tools fill that in:
+
+- `read_image` returns an attachment as an image, so it can actually be looked
+  at. It takes a vault-relative path or the bare filename an embed uses, and
+  resolves the latter the way Obsidian does — an ambiguous name is reported
+  with its candidates rather than guessed at. Oversized images are downscaled
+  and HEIC, TIFF and friends are converted to PNG on the way out, both through
+  `sips`, in a temporary directory; the file in the vault is never touched.
+  SVG comes back as its source, being markup.
+- `find_images` lists attachments with their size, dimensions and the notes
+  that embed them, and filters by name, folder, orphans (no note links to it)
+  or broken embeds (no file behind the link). Dimensions are read from the
+  file header rather than by shelling out per file.
+- `write_image` saves an image from base64, a URL or a local file, and can
+  append the Obsidian embed to a note.
+
+These are merged into mcpvault's tool listing rather than mounted separately,
+so the vault stays one connector. mcpvault registers `tools/list` and
+`tools/call` on a low-level `Server`, which leaves no seam to register extra
+tools into, so `merge.ts` fronts it over a linked in-memory transport and
+routes each call to whichever side owns the name.
+
+Writing is the part with teeth, so it is fenced in:
+
+- Every path is resolved against the vault root and anything that climbs out
+  is refused.
+- The bytes are sniffed and must be a real image that agrees with the
+  destination extension. A name is not evidence.
+- An existing file is never replaced unless `overwrite` is passed.
+- A URL import is http(s) only, must answer with an `image/*` type, and is
+  refused if the host resolves to a private address. The daemon is reachable
+  from the internet through a tunnel, and this stops it being used to reach
+  into the network it sits in. `fetch` resolves again after the check, so this
+  narrows the hole rather than closing it.
+- Copying from a local path is off until `PORTCALL_VAULT_IMPORT_DIRS` names
+  the folders it may read. The mount otherwise touches nothing outside the
+  vault, and that is worth keeping deliberate.
+
+A read-only mount serves `read_image` and `find_images` and withholds
+`write_image`.
 
 ### KIS
 
@@ -169,6 +214,7 @@ All host-specific values come from the environment.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORTCALL_VAULT_PATH` | *(required)* | Absolute path to the Obsidian vault to serve |
+| `PORTCALL_VAULT_IMPORT_DIRS` | *(unset)* | Colon-separated folders `write_image` may copy from, `~/` expanded. Unset means none |
 | `PORTCALL_PORT` | `7100` | TCP port |
 | `PORTCALL_HOST` | `127.0.0.1` | Bind interface |
 | `PORTCALL_TOKEN` | *(unset)* | Static bearer token. Unset means no authentication |
@@ -261,7 +307,12 @@ src/
   adapters/
     inProcess.ts       library-factory adapter
   plugins/
-    vault.ts           mcpvault
+    vault/             mcpvault plus image tools
+      index.ts         plugin factory
+      merge.ts         fronts mcpvault so extra tools share the mount
+      image.ts         read_image, find_images, write_image
+      media.ts         format sniffing, header dimensions, sips transcoding
+      paths.ts         vault confinement, walking, embed parsing
     kis/               Korea Investment quotations (read-only)
       index.ts         plugin factory, process-lifetime token store and client
       client.ts        quotation allowlist, headers, throttle, error mapping
@@ -274,6 +325,8 @@ test/
   auth.test.ts         bearer token check
   kis-token.test.ts    token caching, single-flight, restart reload
   kis-client.test.ts   allowlist, headers, KIS error surfacing
+  vault-media.test.ts  header parsing, format sniffing, path confinement
+  vault-image.test.ts  the image tools, driven through the merged server
   helpers.ts           server harness and MCP request builders
 ```
 
