@@ -1,9 +1,13 @@
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { deflateSync, crc32 } from 'node:zlib';
+
+const run = promisify(execFile);
 
 import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { createServer } from '@bitbonsai/mcpvault';
@@ -143,6 +147,22 @@ before(async () => {
 
   await writeFile(join(outside, 'desktop.png'), png(12, 12));
   await writeFile(join(outside, 'secret.png'), png(12, 12));
+
+  // A photo, as a JPEG, big enough that returning it means re-encoding it.
+  await writeFile(join(outside, 'source.png'), png(2400, 1800));
+  await run('/usr/bin/sips', [
+    '-s', 'format', 'jpeg', '-s', 'formatOptions', '90',
+    join(outside, 'source.png'), '--out', join(vault, 'photo.jpg'),
+  ]);
+
+  // Frontmatter and canvas references, each the only use of its image.
+  await writeFile(join(vault, 'covered.png'), png(8, 8));
+  await writeFile(join(vault, 'boarded.png'), png(8, 8));
+  await writeFile(join(vault, 'cover.md'), '---\ncover: covered.png\n---\n\nNo embed in the body.\n');
+  await writeFile(
+    join(vault, 'board.canvas'),
+    JSON.stringify({ nodes: [{ id: '1', type: 'file', file: 'boarded.png' }], edges: [] }),
+  );
 });
 
 after(async () => {
@@ -170,7 +190,9 @@ describe('merging with mcpvault', () => {
     const harness = await openHarness(vault);
     try {
       const stats = await harness.text('get_vault_stats');
-      assert.match(stats, /"notes":\s*2/);
+      // mcpvault's own payload, so the call plainly reached it.
+      assert.match(stats, /"notes":\s*\d+/);
+      assert.match(stats, /"folders":\s*\d+/);
     } finally {
       await harness.close();
     }
@@ -438,6 +460,184 @@ describe('write_image', () => {
         await harness.text('write_image', { path: 'attachments/ssrf.png', url: 'http://169.254.169.254/latest.png' }),
         /private address/,
       );
+    } finally {
+      await harness.close();
+    }
+  });
+});
+
+describe('choosing an output format', () => {
+  test('keeps a photo as JPEG instead of inflating it to PNG', async () => {
+    const harness = await openHarness(vault);
+    try {
+      const parts = await harness.call('read_image', { path: 'photo.jpg', maxEdge: 800 });
+      const image = parts.find((part) => part.type === 'image');
+      assert.equal(image?.mimeType, 'image/jpeg', 'a JPEG source comes back as JPEG');
+    } finally {
+      await harness.close();
+    }
+  });
+
+  test('keeps a screenshot as PNG, where JPEG would be worse', async () => {
+    const harness = await openHarness(vault);
+    try {
+      const parts = await harness.call('read_image', { path: 'wide.png', maxEdge: 200 });
+      assert.equal(parts.find((part) => part.type === 'image')?.mimeType, 'image/png');
+    } finally {
+      await harness.close();
+    }
+  });
+
+  test('a JPEG that already fits is passed through untouched', async () => {
+    const harness = await openHarness(vault);
+    try {
+      const parts = await harness.call('read_image', { path: 'photo.jpg', maxEdge: 4096 });
+      const image = parts.find((part) => part.type === 'image');
+      assert.equal(image?.mimeType, 'image/jpeg');
+      const onDisk = await readFile(join(vault, 'photo.jpg'));
+      assert.equal(Buffer.from(image?.data ?? '', 'base64').byteLength, onDisk.byteLength);
+    } finally {
+      await harness.close();
+    }
+  });
+});
+
+describe('counting a use that is not an embed', () => {
+  test('a frontmatter cover keeps an image out of the orphan list', async () => {
+    const harness = await openHarness(vault);
+    try {
+      const listing = await harness.text('find_images', { query: 'covered' });
+      assert.match(listing, /"cover\.md"/, 'the note that names it is credited');
+      const orphans = await harness.text('find_images', { status: 'orphan' });
+      assert.ok(!orphans.includes('covered.png'), 'an image used as a cover is not an orphan');
+    } finally {
+      await harness.close();
+    }
+  });
+
+  test('a canvas node keeps an image out of the orphan list', async () => {
+    const harness = await openHarness(vault);
+    try {
+      const listing = await harness.text('find_images', { query: 'boarded' });
+      assert.match(listing, /"board\.canvas"/);
+      const orphans = await harness.text('find_images', { status: 'orphan' });
+      assert.ok(!orphans.includes('boarded.png'), 'an image on a canvas is not an orphan');
+    } finally {
+      await harness.close();
+    }
+  });
+
+  test('frontmatter never invents a broken link', async () => {
+    const harness = await openHarness(vault);
+    try {
+      const broken = await harness.text('find_images', { status: 'broken' });
+      assert.match(broken, /gone\.png/, 'a real broken embed is still reported');
+      assert.ok(!broken.includes('covered.png'));
+    } finally {
+      await harness.close();
+    }
+  });
+
+  test('reports how much the matched images weigh', async () => {
+    const harness = await openHarness(vault);
+    try {
+      const listing = await harness.text('find_images');
+      assert.match(listing, /"matchedBytes": \d+/);
+    } finally {
+      await harness.close();
+    }
+  });
+});
+
+describe('delete_image', () => {
+  test('needs the path repeated exactly', async () => {
+    const harness = await openHarness(vault);
+    try {
+      await writeFile(join(vault, 'doomed.png'), png(8, 8));
+      const message = await harness.text('delete_image', { path: 'doomed.png', confirmPath: 'other.png' });
+      assert.match(message, /confirmPath does not match/);
+      await access(join(vault, 'doomed.png'));
+    } finally {
+      await harness.close();
+    }
+  });
+
+  test('deletes an orphan', async () => {
+    const harness = await openHarness(vault);
+    try {
+      await writeFile(join(vault, 'doomed.png'), png(8, 8));
+      assert.match(await harness.text('delete_image', { path: 'doomed.png', confirmPath: 'doomed.png' }), /^Deleted/);
+      await assert.rejects(access(join(vault, 'doomed.png')));
+    } finally {
+      await harness.close();
+    }
+  });
+
+  test('will not delete an image a note still embeds', async () => {
+    const harness = await openHarness(vault);
+    try {
+      const message = await harness.text('delete_image', {
+        path: 'attachments/wide.png',
+        confirmPath: 'attachments/wide.png',
+      });
+      assert.match(message, /still used by .*note\.md/);
+      await access(join(vault, 'attachments', 'wide.png'));
+    } finally {
+      await harness.close();
+    }
+  });
+
+  test('will not delete an image only a cover or a canvas uses', async () => {
+    const harness = await openHarness(vault);
+    try {
+      assert.match(
+        await harness.text('delete_image', { path: 'covered.png', confirmPath: 'covered.png' }),
+        /still used by cover\.md/,
+      );
+      assert.match(
+        await harness.text('delete_image', { path: 'boarded.png', confirmPath: 'boarded.png' }),
+        /still used by board\.canvas/,
+      );
+      await access(join(vault, 'covered.png'));
+      await access(join(vault, 'boarded.png'));
+    } finally {
+      await harness.close();
+    }
+  });
+
+  test('force deletes a referenced image and says what used it', async () => {
+    const harness = await openHarness(vault);
+    try {
+      await writeFile(join(vault, 'used.png'), png(8, 8));
+      await writeFile(join(vault, 'uses.md'), '![[used.png]]\n');
+      const message = await harness.text('delete_image', {
+        path: 'used.png',
+        confirmPath: 'used.png',
+        force: true,
+      });
+      assert.match(message, /was used by uses\.md/);
+      await assert.rejects(access(join(vault, 'used.png')));
+    } finally {
+      await rm(join(vault, 'uses.md'), { force: true });
+      await harness.close();
+    }
+  });
+
+  test('names the near miss rather than deleting it', async () => {
+    const harness = await openHarness(vault);
+    try {
+      const message = await harness.text('delete_image', { path: 'wide.png', confirmPath: 'wide.png' });
+      assert.match(message, /not a vault path.*attachments\/wide\.png/s);
+      await access(join(vault, 'attachments', 'wide.png'));
+    } finally {
+      await harness.close();
+    }
+  });
+
+  test('a read-only mount offers no way to delete', async () => {
+    const harness = await openHarness(vault, { readOnly: true });
+    try {
+      assert.ok(!(await harness.names()).includes('delete_image'));
     } finally {
       await harness.close();
     }

@@ -106,3 +106,56 @@ function basename(path: string): string {
   const cut = path.lastIndexOf('/');
   return cut === -1 ? path : path.slice(cut + 1);
 }
+
+/** Extensions that make a frontmatter or canvas value worth resolving. */
+const IMAGE_SUFFIX = /\.(png|jpe?g|gif|webp|svg|bmp|tiff?|heic|heif|avif|ico)$/i;
+
+/**
+ * Image references in a note's frontmatter.
+ *
+ * Cover images, banners and thumbnail lists live here rather than in the
+ * body, and a note that only names an image in its frontmatter still uses
+ * it. This reads the block loosely rather than parsing YAML, so a filename
+ * containing spaces can also yield a partial token — harmless, because the
+ * result is only ever used to mark an image as referenced, never to report
+ * a link as broken.
+ */
+export function frontmatterRefs(markdown: string): string[] {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(markdown);
+  if (match === null) return [];
+
+  // A remote address is not a vault file, and its path would match below.
+  const block = match[1]!.replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, ' ');
+  const found: string[] = [];
+
+  for (const link of block.matchAll(/\[\[([^\]|#]+)/g)) found.push(link[1]!.trim());
+  for (const quoted of block.matchAll(/["']([^"']+)["']/g)) found.push(quoted[1]!.trim());
+  for (const bare of block.matchAll(/[^\s"'[\],]+/g)) found.push(bare[0].replace(/^[-:]+/, '').trim());
+
+  return [...new Set(found.filter((value) => IMAGE_SUFFIX.test(value)))];
+}
+
+/**
+ * Files an Obsidian canvas places on its board.
+ *
+ * A canvas is JSON with a `file` node per embedded file. One that will not
+ * parse is skipped rather than failing the listing it is part of.
+ */
+export function canvasRefs(json: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return [];
+  }
+
+  const nodes = (parsed as { nodes?: unknown }).nodes;
+  if (!Array.isArray(nodes)) return [];
+
+  const found: string[] = [];
+  for (const node of nodes) {
+    const file = (node as { file?: unknown }).file;
+    if (typeof file === 'string' && file !== '') found.push(file);
+  }
+  return [...new Set(found)];
+}

@@ -93,21 +93,22 @@ its owner.
 
 mcpvault reads and writes notes but has nothing for attachments, so an
 embedded screenshot arrives as the literal text `![[shot.png]]` and the image
-itself is unreachable. Three tools fill that in:
+itself is unreachable. Four tools fill that in:
 
 - `read_image` returns an attachment as an image, so it can actually be looked
   at. It takes a vault-relative path or the bare filename an embed uses, and
   resolves the latter the way Obsidian does — an ambiguous name is reported
-  with its candidates rather than guessed at. Oversized images are downscaled
-  and HEIC, TIFF and friends are converted to PNG on the way out, both through
-  `sips`, in a temporary directory; the file in the vault is never touched.
+  with its candidates rather than guessed at. The file in the vault is never
+  touched: resizing and conversion happen on a copy in a temporary directory.
   SVG comes back as its source, being markup.
-- `find_images` lists attachments with their size, dimensions and the notes
-  that embed them, and filters by name, folder, orphans (no note links to it)
-  or broken embeds (no file behind the link). Dimensions are read from the
-  file header rather than by shelling out per file.
+- `find_images` lists attachments with their size, dimensions and what uses
+  them, and filters by name, folder, orphans (nothing links to it) or broken
+  embeds (no file behind the link). Dimensions are read from the file header
+  rather than by shelling out per file.
 - `write_image` saves an image from base64, a URL or a local file, and can
   append the Obsidian embed to a note.
+- `delete_image` removes an attachment, for clearing out the orphans
+  `find_images` turns up.
 
 These are merged into mcpvault's tool listing rather than mounted separately,
 so the vault stays one connector. mcpvault registers `tools/list` and
@@ -115,24 +116,59 @@ so the vault stays one connector. mcpvault registers `tools/list` and
 tools into, so `merge.ts` fronts it over a linked in-memory transport and
 routes each call to whichever side owns the name.
 
-Writing is the part with teeth, so it is fenced in:
+#### What counts as using an image
+
+An image is in use if a note embeds it, if a note names it in frontmatter as
+a cover or a banner, or if a canvas puts it on a board. Only the first can
+report a link as *broken*: frontmatter is read by pattern rather than parsed
+as YAML, so an over-eager token there would invent a missing file. Reading it
+loosely is still worth it in the other direction, where the cost of missing a
+reference is calling a file an orphan when it is not — and `delete_image`
+refuses an image anything still uses.
+
+#### Returning an image
+
+Re-encoding is done with `sips`, which ships with macOS: the daemon is a
+personal service on one Mac, so that is one less native dependency to build
+and keep current. An image already within the pixel and byte budget is sent
+untouched, which also means an animated GIF still animates.
+
+When re-encoding is unavoidable, the source format decides the target,
+because it is the best available hint about the content. Measured on a
+4032×3024 photo and a 3000×2000 screenshot:
+
+| Source | Sent as | Keeping it | Switching |
+|---|---|---|---|
+| JPEG photo | JPEG | 1,056 kB | 2,930 kB as PNG |
+| HEIC photo | JPEG | 1,086 kB | 3,005 kB as PNG |
+| PNG screenshot | PNG | 33 kB | 75 kB as JPEG |
+
+So JPEG, HEIC and AVIF are re-encoded as JPEG; PNG, GIF, TIFF, BMP and ICO as
+PNG. `sips` cannot write WebP, so a WebP that has to be re-encoded becomes
+PNG, with JPEG behind it because a WebP is as likely to be photographic. If
+the result still will not fit, the longest edge is halved, twice.
+
+#### Fencing in the writes
 
 - Every path is resolved against the vault root and anything that climbs out
   is refused.
 - The bytes are sniffed and must be a real image that agrees with the
   destination extension. A name is not evidence.
-- An existing file is never replaced unless `overwrite` is passed.
-- A URL import is http(s) only, must answer with an `image/*` type, and is
-  refused if the host resolves to a private address. The daemon is reachable
-  from the internet through a tunnel, and this stops it being used to reach
-  into the network it sits in. `fetch` resolves again after the check, so this
-  narrows the hole rather than closing it.
+- An existing file is never replaced unless `overwrite` is passed, and
+  `delete_image` needs the path repeated in `confirmPath`.
+- A URL import is http(s) only and must answer with an `image/*` type.
+  Redirects are followed by hand, up to four, so that **every hop** is checked
+  against private addresses — a public host that redirects to a private one
+  gets no further than the check. The daemon is reachable from the internet
+  through a tunnel, and this stops it being used to reach into the network it
+  sits in. `fetch` resolves again after each check, so this narrows the hole
+  rather than closing it.
 - Copying from a local path is off until `PORTCALL_VAULT_IMPORT_DIRS` names
   the folders it may read. The mount otherwise touches nothing outside the
   vault, and that is worth keeping deliberate.
 
-A read-only mount serves `read_image` and `find_images` and withholds
-`write_image`.
+A read-only mount serves `read_image` and `find_images`, and withholds
+`write_image` and `delete_image`.
 
 ### KIS
 
@@ -310,9 +346,9 @@ src/
     vault/             mcpvault plus image tools
       index.ts         plugin factory
       merge.ts         fronts mcpvault so extra tools share the mount
-      image.ts         read_image, find_images, write_image
-      media.ts         format sniffing, header dimensions, sips transcoding
-      paths.ts         vault confinement, walking, embed parsing
+      image.ts         read_image, find_images, write_image, delete_image
+      media.ts         format sniffing, header dimensions, sips re-encoding
+      paths.ts         vault confinement, walking, embed/frontmatter/canvas refs
     kis/               Korea Investment quotations (read-only)
       index.ts         plugin factory, process-lifetime token store and client
       client.ts        quotation allowlist, headers, throttle, error mapping
@@ -325,7 +361,7 @@ test/
   auth.test.ts         bearer token check
   kis-token.test.ts    token caching, single-flight, restart reload
   kis-client.test.ts   allowlist, headers, KIS error surfacing
-  vault-media.test.ts  header parsing, format sniffing, path confinement
+  vault-media.test.ts  header parsing, format sniffing, reference extraction
   vault-image.test.ts  the image tools, driven through the merged server
   helpers.ts           server harness and MCP request builders
 ```

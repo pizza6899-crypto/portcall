@@ -9,7 +9,7 @@ import {
   parseDimensions,
   sniffFormat,
 } from '../src/plugins/vault/media.js';
-import { insideVault, parseEmbeds, resolveTarget } from '../src/plugins/vault/paths.js';
+import { canvasRefs, frontmatterRefs, insideVault, parseEmbeds, resolveTarget } from '../src/plugins/vault/paths.js';
 
 function pngHeader(width: number, height: number): Buffer {
   const header = Buffer.alloc(24);
@@ -178,5 +178,41 @@ describe('resolving an embed target', () => {
 
   test('finds nothing for a name that is not there', () => {
     assert.deepEqual(resolveTarget('missing.png', files), []);
+  });
+});
+
+describe('frontmatter references', () => {
+  test('finds an image however the note names it', () => {
+    assert.deepEqual(frontmatterRefs('---\ncover: shot.png\n---\nbody'), ['shot.png']);
+    assert.deepEqual(frontmatterRefs('---\nbanner: "[[a banner.png]]"\n---\n')[0], 'a banner.png');
+    assert.deepEqual(frontmatterRefs('---\nthumbs:\n  - a.png\n  - sub/b.jpg\n---\n'), ['a.png', 'sub/b.jpg']);
+    assert.deepEqual(frontmatterRefs('---\ngallery: [x.png, y.webp]\n---\n'), ['x.png', 'y.webp']);
+  });
+
+  test('ignores what is not a vault image', () => {
+    assert.deepEqual(frontmatterRefs('---\nimage: https://example.com/remote.png\n---\n'), []);
+    assert.deepEqual(frontmatterRefs('---\ntitle: Notes\ntags: [a, b]\ndate: 2026-09-20\nfile: report.pdf\n---\n'), []);
+    assert.deepEqual(frontmatterRefs('# Heading\n\n---\n\ncover: notfrontmatter.png\n'), []);
+    assert.deepEqual(frontmatterRefs('no frontmatter at all\n\n![[body.png]]\n'), []);
+  });
+});
+
+describe('canvas references', () => {
+  test('collects the files a board places', () => {
+    const board = JSON.stringify({
+      nodes: [
+        { id: '1', type: 'file', file: 'diagram.png' },
+        { id: '2', type: 'text', text: 'hello' },
+        { id: '3', type: 'file', file: 'note.md' },
+      ],
+      edges: [],
+    });
+    assert.deepEqual(canvasRefs(board), ['diagram.png', 'note.md']);
+  });
+
+  test('skips a canvas it cannot read rather than failing', () => {
+    assert.deepEqual(canvasRefs('not json at all'), []);
+    assert.deepEqual(canvasRefs('{"nodes":"wrong shape"}'), []);
+    assert.deepEqual(canvasRefs('{}'), []);
   });
 });

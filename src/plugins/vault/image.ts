@@ -1,5 +1,5 @@
 import { lookup } from 'node:dns/promises';
-import { mkdir, open, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { z } from 'zod';
 
@@ -15,7 +15,7 @@ import {
   sniffFormat,
   type Dimensions,
 } from './media.js';
-import { insideVault, parseEmbeds, resolveTarget, walkVault } from './paths.js';
+import { canvasRefs, frontmatterRefs, insideVault, parseEmbeds, resolveTarget, walkVault } from './paths.js';
 
 /** Ceiling on one file written into the vault. */
 const MAX_WRITE_BYTES = 25_000_000;
@@ -131,6 +131,62 @@ function readImageTool(options: ImageToolOptions): ExtraTool<z.infer<typeof read
   };
 }
 
+interface References {
+  /** Image path → the notes and canvases that use it. */
+  referencedBy: Map<string, string[]>;
+  /** Embeds whose target is nowhere in the vault. */
+  broken: { embed: string; inNote: string }[];
+  noteCount: number;
+}
+
+/**
+ * Work out which images are in use, and which embeds point at nothing.
+ *
+ * Three places count as a use: an embed in a note body, an image named in
+ * frontmatter (a cover or a banner), and a file node on a canvas. Only the
+ * first can report a broken link — frontmatter is read loosely, so an
+ * over-eager token there would invent a missing file.
+ */
+async function scanReferences(vaultPath: string, files: readonly string[]): Promise<References> {
+  const notes = files.filter((file) => file.toLowerCase().endsWith('.md'));
+  const canvases = files.filter((file) => file.toLowerCase().endsWith('.canvas'));
+
+  const referencedBy = new Map<string, string[]>();
+  const broken: { embed: string; inNote: string }[] = [];
+
+  const record = (matches: readonly string[], source: string): void => {
+    for (const match of matches) {
+      if (!isImagePath(match)) continue;
+      const seen = referencedBy.get(match);
+      if (seen === undefined) referencedBy.set(match, [source]);
+      else if (!seen.includes(source)) seen.push(source);
+    }
+  };
+
+  for (const note of notes) {
+    const markdown = await readFile(insideVault(vaultPath, note), 'utf8');
+
+    for (const target of parseEmbeds(markdown)) {
+      const matches = resolveTarget(target, files);
+      if (matches.length === 0) {
+        // `![[some note]]` is a note transclusion, not a missing attachment.
+        if (isImagePath(target)) broken.push({ embed: target, inNote: note });
+        continue;
+      }
+      record(matches, note);
+    }
+
+    for (const target of frontmatterRefs(markdown)) record(resolveTarget(target, files), note);
+  }
+
+  for (const canvas of canvases) {
+    const board = await readFile(insideVault(vaultPath, canvas), 'utf8');
+    for (const target of canvasRefs(board)) record(resolveTarget(target, files), canvas);
+  }
+
+  return { referencedBy, broken, noteCount: notes.length };
+}
+
 const findSchema = z.object({
   query: z.string().optional().describe('Case-insensitive substring of the path or filename.'),
   folder: z.string().optional().describe('Restrict the search to one folder, vault-relative.'),
@@ -152,35 +208,12 @@ function findImagesTool(options: ImageToolOptions): ExtraTool<z.infer<typeof fin
     run: async ({ query, folder, status = 'all', limit = 100 }) => {
       const files = await walkVault(options.vaultPath);
       const images = files.filter(isImagePath);
-      const notes = files.filter((file) => file.toLowerCase().endsWith('.md'));
-
-      const referencedBy = new Map<string, string[]>();
-      const broken: { embed: string; inNote: string }[] = [];
-
-      for (const note of notes) {
-        const markdown = await readFile(insideVault(options.vaultPath, note), 'utf8');
-        for (const target of parseEmbeds(markdown)) {
-          const matches = resolveTarget(target, files);
-          if (matches.length === 0) {
-            // Only an image-looking target is reported: `![[some note]]` is a
-            // note transclusion, not a missing attachment.
-            if (isImagePath(target)) broken.push({ embed: target, inNote: note });
-            continue;
-          }
-          for (const match of matches) {
-            if (!isImagePath(match)) continue;
-            const seen = referencedBy.get(match);
-            if (seen === undefined) referencedBy.set(match, [note]);
-            else if (!seen.includes(note)) seen.push(note);
-          }
-        }
-      }
+      const { referencedBy, broken, noteCount } = await scanReferences(options.vaultPath, files);
 
       if (status === 'broken') {
-        const rows = broken.slice(0, limit);
-        return result(`${broken.length} broken image embeds across ${notes.length} notes.`, {
+        return result(`${broken.length} broken image embeds across ${noteCount} notes.`, {
           brokenCount: broken.length,
-          broken: rows,
+          broken: broken.slice(0, limit),
         });
       }
 
@@ -193,10 +226,13 @@ function findImagesTool(options: ImageToolOptions): ExtraTool<z.infer<typeof fin
         return true;
       });
 
+      let selectedBytes = 0;
       const rows = [];
-      for (const image of selected.slice(0, limit)) {
+      for (const image of selected) {
         const full = insideVault(options.vaultPath, image);
         const { size } = await stat(full);
+        selectedBytes += size;
+        if (rows.length >= limit) continue;
         const dimensions = extensionOf(image) === 'svg' ? undefined : parseDimensions(await readHead(full, 1024));
         rows.push({
           path: image,
@@ -208,11 +244,22 @@ function findImagesTool(options: ImageToolOptions): ExtraTool<z.infer<typeof fin
 
       const orphans = images.filter((image) => !referencedBy.has(image)).length;
       return result(
-        `${selected.length} of ${images.length} images matched${selected.length > rows.length ? `, showing ${rows.length}` : ''}. ${orphans} orphaned, ${broken.length} broken embeds.`,
-        { matched: selected.length, totalImages: images.length, orphanCount: orphans, brokenCount: broken.length, images: rows },
+        `${selected.length} of ${images.length} images matched${selected.length > rows.length ? `, showing ${rows.length}` : ''}, ${megabytes(selectedBytes)}. ${orphans} orphaned, ${broken.length} broken embeds.`,
+        {
+          matched: selected.length,
+          totalImages: images.length,
+          matchedBytes: selectedBytes,
+          orphanCount: orphans,
+          brokenCount: broken.length,
+          images: rows,
+        },
       );
     },
   };
+}
+
+function megabytes(bytes: number): string {
+  return bytes < 1_000_000 ? `${Math.round(bytes / 1000)} kB` : `${(bytes / 1_000_000).toFixed(1)} MB`;
 }
 
 const writeSchema = z
@@ -234,10 +281,11 @@ const writeSchema = z
  * Addresses that must not be reachable through this tool.
  *
  * The daemon is exposed to the internet through a tunnel, so a URL import is
- * a way to ask it to make a request from inside the home network. This is
- * checked at resolution time and `fetch` resolves again, so it narrows the
- * hole rather than closing it — good enough for a personal service, and the
- * reason the check exists at all.
+ * a way to ask it to make a request from inside the home network. Every hop
+ * is checked, not just the first, because otherwise a public host could
+ * redirect to a private one. `fetch` resolves again after the check, so this
+ * narrows the hole rather than closing it — good enough for a personal
+ * service, and the reason the check exists at all.
  */
 function isPrivateAddress(address: string): boolean {
   if (address.includes(':')) {
@@ -259,19 +307,36 @@ function isPrivateAddress(address: string): boolean {
   return false;
 }
 
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/** Redirects are followed by hand so each hop can be checked; four is plenty. */
+const MAX_REDIRECTS = 4;
+
 async function download(rawUrl: string): Promise<Buffer> {
-  const url = new URL(rawUrl);
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error(`Only http and https URLs can be imported: ${url.protocol}`);
-  }
-  for (const { address } of await lookup(url.hostname, { all: true })) {
-    if (isPrivateAddress(address)) throw new Error(`Refusing to fetch a private address: ${url.hostname}`);
+  let url = new URL(rawUrl);
+  let response: Response;
+
+  for (let hop = 0; ; hop += 1) {
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      throw new Error(`Only http and https URLs can be imported: ${url.protocol}`);
+    }
+    for (const { address } of await lookup(url.hostname, { all: true })) {
+      if (isPrivateAddress(address)) throw new Error(`Refusing to fetch a private address: ${url.hostname}`);
+    }
+
+    response = await fetch(url, { signal: AbortSignal.timeout(15_000), redirect: 'manual' });
+    if (!REDIRECT_STATUSES.has(response.status)) break;
+
+    const location = response.headers.get('location');
+    if (location === null) throw new Error(`${url.href} redirected without saying where.`);
+    if (hop >= MAX_REDIRECTS) throw new Error(`${rawUrl} redirected more than ${MAX_REDIRECTS} times.`);
+    url = new URL(location, url);
   }
 
-  const response = await fetch(url, { signal: AbortSignal.timeout(15_000), redirect: 'error' });
   if (!response.ok) throw new Error(`Download failed: ${response.status} ${response.statusText}`);
 
-  const contentType = response.headers.get('content-type') ?? '';
+  // Header values are not required to be lower case.
+  const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
   if (!contentType.startsWith('image/')) throw new Error(`That URL is not an image: ${contentType || 'no content-type'}`);
 
   const bytes = Buffer.from(await response.arrayBuffer());
@@ -376,9 +441,59 @@ async function appendEmbed(
   return embed;
 }
 
+const deleteSchema = z.object({
+  path: z.string().min(1).describe('Vault-relative path of the image to delete, exactly as find_images prints it.'),
+  confirmPath: z.string().min(1).describe('Must match `path` character for character.'),
+  force: z.boolean().optional().describe('Delete even though a note or canvas still uses it. Defaults to false.'),
+});
+
+function deleteImageTool(options: ImageToolOptions): ExtraTool<z.infer<typeof deleteSchema>> {
+  return {
+    name: 'delete_image',
+    title: 'Delete image',
+    description:
+      'Delete an image attachment from the vault, for clearing out the orphans find_images turns up. Needs the exact path repeated in `confirmPath`, and refuses an image that a note, its frontmatter or a canvas still uses unless `force` is set. This is not the Obsidian trash: the file is gone.',
+    schema: deleteSchema,
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    run: async ({ path, confirmPath, force = false }) => {
+      if (path !== confirmPath) {
+        throw new Error('confirmPath does not match path. Both must be identical for a delete to go ahead.');
+      }
+      if (!isImagePath(path)) throw new Error(`Not an image extension: ${path}`);
+
+      const files = await walkVault(options.vaultPath);
+      if (!files.includes(path)) {
+        // A near miss is named rather than acted on: deleting whatever a
+        // partial name happened to match is not a mistake worth allowing.
+        const near = resolveTarget(path, files).filter(isImagePath);
+        throw new Error(
+          near.length === 0
+            ? `No such image: ${path}`
+            : `${path} is not a vault path. Did you mean ${near.join(' or ')}?`,
+        );
+      }
+
+      const { referencedBy } = await scanReferences(options.vaultPath, files);
+      const users = referencedBy.get(path) ?? [];
+      if (users.length > 0 && !force) {
+        throw new Error(`${path} is still used by ${users.join(', ')}. Pass force: true to delete it anyway.`);
+      }
+
+      const full = insideVault(options.vaultPath, path);
+      const { size } = await stat(full);
+      await unlink(full);
+
+      return result(
+        `Deleted ${path} (${size} bytes)${users.length === 0 ? '' : `, which was used by ${users.join(', ')}`}.`,
+        { path, bytes: size, wasUsedBy: users },
+      );
+    },
+  };
+}
+
 /** The image tools, in the order they should appear in a listing. */
 export function imageTools(options: ImageToolOptions): ExtraTool<never>[] {
-  const tools = [readImageTool(options), findImagesTool(options)];
-  if (options.readOnly !== true) tools.push(writeImageTool(options));
-  return tools as unknown as ExtraTool<never>[];
+  const tools: unknown[] = [readImageTool(options), findImagesTool(options)];
+  if (options.readOnly !== true) tools.push(writeImageTool(options), deleteImageTool(options));
+  return tools as ExtraTool<never>[];
 }

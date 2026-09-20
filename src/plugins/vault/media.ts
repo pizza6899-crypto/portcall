@@ -159,6 +159,37 @@ export interface PreparedImage {
   note?: string;
 }
 
+type Encoding = 'png' | 'jpeg';
+
+/**
+ * What a format is re-encoded to when it cannot be sent as it is.
+ *
+ * The source format is the best available hint about the content. Measured on
+ * a 4032×3024 photo and a 3000×2000 screenshot: keeping a photo as JPEG is
+ * 2.8× smaller than PNG, and keeping a screenshot as PNG is 2.3× smaller than
+ * JPEG. Re-encoding everything to one format is wrong half the time.
+ *
+ * `sips` cannot write WebP, so a WebP that has to be re-encoded becomes PNG,
+ * with JPEG behind it because a WebP is as likely to be photographic.
+ */
+const RECIPES: Record<string, { format: Encoding; fallback?: Encoding }> = {
+  jpg: { format: 'jpeg' },
+  jpeg: { format: 'jpeg' },
+  heic: { format: 'jpeg' },
+  heif: { format: 'jpeg' },
+  avif: { format: 'jpeg' },
+  webp: { format: 'png', fallback: 'jpeg' },
+  png: { format: 'png' },
+  gif: { format: 'png' },
+  bmp: { format: 'png' },
+  tif: { format: 'png' },
+  tiff: { format: 'png' },
+  ico: { format: 'png' },
+};
+
+/** Measured against q75 and q92; q85 is where the size curve flattens. */
+const JPEG_QUALITY = 85;
+
 /**
  * Get an image into a form that can be returned to a model: a supported
  * format, within the pixel and byte budget.
@@ -167,7 +198,11 @@ export interface PreparedImage {
  * personal service on one Mac, so that is one less native dependency to
  * build and keep current.
  */
-export async function prepareImage(path: string, original: Dimensions | undefined, maxEdge: number): Promise<PreparedImage> {
+export async function prepareImage(
+  path: string,
+  original: Dimensions | undefined,
+  maxEdge: number,
+): Promise<PreparedImage> {
   const extension = extensionOf(path);
   const native = NATIVE_TYPES[extension];
   const longestEdge = original === undefined ? undefined : Math.max(original.width, original.height);
@@ -175,34 +210,49 @@ export async function prepareImage(path: string, original: Dimensions | undefine
 
   if (native !== undefined && !oversized) {
     const data = await readFile(path);
+    // Untouched is always best: it is the original pixels, and an animated
+    // GIF still animates.
     if (data.byteLength <= MAX_IMAGE_BYTES) return { data, mimeType: native };
-    // Within the pixel budget but still too many bytes: re-encode it down.
-    return convert(path, Math.min(maxEdge, longestEdge ?? maxEdge), `re-encoded to fit ${MAX_IMAGE_BYTES} bytes`);
+    return convert(path, extension, Math.min(maxEdge, longestEdge ?? maxEdge), `re-encoded to fit ${MAX_IMAGE_BYTES} bytes`);
   }
 
   const reason =
     native === undefined
-      ? `converted from ${extension.toUpperCase()} to PNG`
+      ? `converted from ${extension.toUpperCase()}`
       : `downscaled from ${original!.width}×${original!.height}`;
-  return convert(path, maxEdge, reason);
+  return convert(path, extension, maxEdge, reason);
 }
 
-async function convert(path: string, maxEdge: number, reason: string): Promise<PreparedImage> {
+async function convert(path: string, extension: string, maxEdge: number, reason: string): Promise<PreparedImage> {
+  const recipe = RECIPES[extension] ?? { format: 'png' as const };
+
+  // Try the right format first, then the fallback, then halve twice. Once a
+  // format has been ruled out on size there is no point returning to it.
+  const steps: { format: Encoding; edge: number }[] = [{ format: recipe.format, edge: maxEdge }];
+  if (recipe.fallback !== undefined) steps.push({ format: recipe.fallback, edge: maxEdge });
+  const persistent = recipe.fallback ?? recipe.format;
+  let edge = maxEdge;
+  for (let i = 0; i < 2; i += 1) {
+    edge = Math.max(320, Math.floor(edge / 2));
+    steps.push({ format: persistent, edge });
+  }
+
   const directory = await mkdtemp(join(tmpdir(), 'portcall-image-'));
   try {
-    let edge = maxEdge;
-    let last: Buffer | undefined;
-    // Three attempts: a photo that is huge in bytes rather than pixels needs
-    // the edge cut further, and halving twice covers the realistic cases.
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const out = join(directory, `image-${attempt}.png`);
-      await run('/usr/bin/sips', ['-s', 'format', 'png', '-Z', String(edge), path, '--out', out]);
-      last = await readFile(out);
-      if (last.byteLength <= MAX_IMAGE_BYTES) {
-        const suffix = attempt === 0 ? '' : `, longest edge ${edge}px`;
-        return { data: last, mimeType: 'image/png', note: `${reason}${suffix}` };
-      }
-      edge = Math.max(320, Math.floor(edge / 2));
+    for (const [index, step] of steps.entries()) {
+      const out = join(directory, `image-${index}.${step.format === 'jpeg' ? 'jpg' : 'png'}`);
+      const options = step.format === 'jpeg' ? ['-s', 'formatOptions', String(JPEG_QUALITY)] : [];
+      await run('/usr/bin/sips', ['-s', 'format', step.format, ...options, '-Z', String(step.edge), path, '--out', out]);
+
+      const data = await readFile(out);
+      if (data.byteLength > MAX_IMAGE_BYTES) continue;
+
+      const notes = [reason];
+      if (step.format !== recipe.format) notes.push(`re-encoded as ${step.format.toUpperCase()} to fit`);
+      if (step.edge !== maxEdge) notes.push(`longest edge ${step.edge}px`);
+      // A converted GIF is a single frame; saying so beats a silent still.
+      if (extension === 'gif') notes.push('animation not preserved');
+      return { data, mimeType: step.format === 'jpeg' ? 'image/jpeg' : 'image/png', note: notes.join(', ') };
     }
     throw new Error(`Image is too large to return even downscaled: ${path}`);
   } finally {
