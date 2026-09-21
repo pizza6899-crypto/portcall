@@ -437,6 +437,32 @@ describe('what the KIS mount exposes', () => {
     }
   });
 
+  test('the account number KIS echoes back does not travel with the answer', async () => {
+    // Every account call sends the account number and gets it handed straight
+    // back, on rows and on totals alike. Whoever configured the mount already
+    // knows it and the answer goes on to a transcript, so it is dropped on the
+    // way out. Pinned across all four tools and both shapes: the drop was
+    // wired into the two position lists and nowhere else, which reads from the
+    // outside exactly like a measure that is in place.
+    const echoed = { cano: '12345678', acnt_prdt_cd: '01' };
+    const tools = await openTools({
+      rt_cd: '0',
+      output: [{ ...echoed, pdno: 'SOXL' }],
+      output1: [{ ...echoed, ovrs_pdno: 'SOXL' }],
+      output2: [{ ...echoed, tot_pftrt: '1.0' }],
+      output3: [{ ...echoed, tot_asst_amt: '100' }],
+    });
+    try {
+      for (const name of ['overseas_holdings', 'overseas_balance', 'overseas_executions', 'overseas_realized_pnl']) {
+        const answer = JSON.stringify((await tools.call(name))['result']);
+        assert.ok(!answer.includes('"cano"'), `${name} passes the account number through`);
+        assert.ok(!answer.includes('"acnt_prdt_cd"'), `${name} passes the product code through`);
+      }
+    } finally {
+      await tools.close();
+    }
+  });
+
   test('the account tools stay away without an account', async () => {
     const client: KisClient = { get: async () => ({}), getAll: async () => [] };
     const server = new McpServer({ name: 'kis-test', version: '0' });

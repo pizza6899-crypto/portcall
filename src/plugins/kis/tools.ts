@@ -648,23 +648,38 @@ function asRows(
 }
 
 /**
- * The account number KIS echoes back on every holding row. It is already
- * known to whoever configured the plugin, and repeating it in every response
- * only widens where it travels.
+ * The account number KIS echoes back on an account answer — on the rows, on
+ * the per-currency breakdown and on the totals alike. It is already known to
+ * whoever configured the plugin, and repeating it in every response only
+ * widens where it travels.
+ *
+ * Passed at every account call site rather than filtered centrally, because
+ * `rename` deliberately lets an unmapped key through: that is what surfaces a
+ * field KIS added without documenting, and it is also what carries this one.
  */
 const ACCOUNT_ECHO = new Set(['cano', 'acnt_prdt_cd']);
 
 /** Flatten one output array across every continuation page. */
-function collect(pages: Record<string, unknown>[], key: string, fields: Record<string, string>) {
-  return pages.flatMap((page) => asRows(page[key], fields));
+function collect(
+  pages: Record<string, unknown>[],
+  key: string,
+  fields: Record<string, string>,
+  drop?: ReadonlySet<string>,
+) {
+  return pages.flatMap((page) => asRows(page[key], fields, drop));
 }
 
 /** The last page carries the running totals, so later pages win. */
-function lastObject(pages: Record<string, unknown>[], key: string, fields: Record<string, string>) {
+function lastObject(
+  pages: Record<string, unknown>[],
+  key: string,
+  fields: Record<string, string>,
+  drop?: ReadonlySet<string>,
+) {
   for (let i = pages.length - 1; i >= 0; i -= 1) {
     const value = pages[i]?.[key];
     const source = Array.isArray(value) ? value[0] : value;
-    if (typeof source === 'object' && source !== null) return rename(source, fields);
+    if (typeof source === 'object' && source !== null) return rename(source, fields, drop);
   }
   return {};
 }
@@ -1196,7 +1211,7 @@ function registerAccountTools(server: McpServer, client: KisClient, account: Kis
       const data = {
         exchange,
         positions: pages.flatMap((page) => asRows(page['output1'], HOLDING_FIELDS, ACCOUNT_ECHO)),
-        totals: lastObject(pages, 'output2', HOLDING_TOTAL_FIELDS),
+        totals: lastObject(pages, 'output2', HOLDING_TOTAL_FIELDS, ACCOUNT_ECHO),
       };
       return result(`${data.positions.length} positions on ${exchange}`, data);
     },
@@ -1237,8 +1252,8 @@ function registerAccountTools(server: McpServer, client: KisClient, account: Kis
         reportedIn: report,
         country,
         positions: asRows(body['output1'], BALANCE_POSITION_FIELDS, ACCOUNT_ECHO),
-        currencies: asRows(body['output2'], BALANCE_CURRENCY_FIELDS),
-        totals: rename(totalsSource, BALANCE_TOTAL_FIELDS),
+        currencies: asRows(body['output2'], BALANCE_CURRENCY_FIELDS, ACCOUNT_ECHO),
+        totals: rename(totalsSource, BALANCE_TOTAL_FIELDS, ACCOUNT_ECHO),
       };
       return result(
         `${data.positions.length} positions, ${data.currencies.length} currencies, total assets ${String(data.totals['totalAssets'] ?? '?')}`,
@@ -1279,7 +1294,7 @@ function registerAccountTools(server: McpServer, client: KisClient, account: Kis
         ORD_GNO_BRNO: '',
         ODNO: '',
       });
-      const data = { from, to, executions: collect(pages, 'output', EXECUTION_FIELDS) };
+      const data = { from, to, executions: collect(pages, 'output', EXECUTION_FIELDS, ACCOUNT_ECHO) };
       return result(`${data.executions.length} records between ${from} and ${to}`, data);
     },
   );
@@ -1319,8 +1334,8 @@ function registerAccountTools(server: McpServer, client: KisClient, account: Kis
         from,
         to,
         reportedIn: report,
-        disposals: collect(pages, 'output1', PNL_ROW_FIELDS),
-        totals: lastObject(pages, 'output2', PNL_TOTAL_FIELDS),
+        disposals: collect(pages, 'output1', PNL_ROW_FIELDS, ACCOUNT_ECHO),
+        totals: lastObject(pages, 'output2', PNL_TOTAL_FIELDS, ACCOUNT_ECHO),
       };
       return result(
         `${data.disposals.length} disposals between ${from} and ${to}, realised ${String(data.totals['realizedPnl'] ?? '?')}`,
