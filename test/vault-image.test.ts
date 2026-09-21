@@ -329,6 +329,42 @@ describe('what a write leaves behind', () => {
     }
   });
 
+  test('an edit made while the image was downloading is not overwritten', async () => {
+    // The note is read to prove it is there before a byte is written, which is
+    // what the test above pins. Holding on to that read and writing it back
+    // afterwards is a different thing: a URL import waits on the network, and
+    // anything typed into the note in the meantime was silently discarded.
+    const scratch = await mkdtemp(join(tmpdir(), 'portcall-race-'));
+    const note = join(scratch, 'racing.md');
+    await writeFile(note, '# Racing\n\nwritten before the call\n');
+
+    const harness = await openHarness(scratch);
+    const realFetch = globalThis.fetch;
+    // An IP literal so the SSRF check resolves it without touching a resolver.
+    globalThis.fetch = (async () => {
+      // Stands in for an Obsidian autosave landing mid-download.
+      await writeFile(note, '# Racing\n\nwritten before the call\nwritten during the download\n');
+      return new Response(png(8, 8), { status: 200, headers: { 'content-type': 'image/png' } });
+    }) as typeof fetch;
+
+    try {
+      const summary = await harness.text('write_image', {
+        path: 'raced.png',
+        url: 'http://93.184.216.34/raced.png',
+        embedIn: 'racing.md',
+      });
+      assert.match(summary, /^Wrote raced\.png/);
+
+      const after = await readFile(note, 'utf8');
+      assert.match(after, /written during the download/, 'the concurrent edit survives');
+      assert.match(after, /!\[\[raced\.png\]\]/, 'and the embed is appended to it');
+    } finally {
+      globalThis.fetch = realFetch;
+      await harness.close();
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
   test('a write leaves no staging file behind', async () => {
     const scratch = await mkdtemp(join(tmpdir(), 'portcall-staging-'));
     const harness = await openHarness(scratch);

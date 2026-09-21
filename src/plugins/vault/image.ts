@@ -519,28 +519,32 @@ async function place(destination: string, bytes: Buffer): Promise<void> {
   }
 }
 
-interface Note {
-  full: string;
-  markdown: string;
-}
-
-/** Find the note an embed will be appended to, before anything is written. */
-async function openNote(vaultPath: string, notePath: string): Promise<Note> {
+/**
+ * Find the note an embed will be appended to, before anything is written.
+ *
+ * Only the path is carried forward. Keeping the body read here and writing
+ * that copy back afterwards would discard anything typed into the note in
+ * between — and a URL import spends the whole download inside that window.
+ * The read still happens, because proving the note is readable is the point.
+ */
+async function openNote(vaultPath: string, notePath: string): Promise<string> {
   const full = insideVault(vaultPath, notePath.toLowerCase().endsWith('.md') ? notePath : `${notePath}.md`);
-  const markdown = await readFile(full, 'utf8').catch(() => {
+  await readFile(full, 'utf8').catch(() => {
     throw new Error(`No note to embed into: ${notePath}`);
   });
-  return { full, markdown };
+  return full;
 }
 
 /** Append an embed to a note, using the short form when the name is unambiguous. */
-async function appendEmbed(vaultPath: string, note: Note, imagePath: string, alt: string | undefined): Promise<string> {
+async function appendEmbed(vaultPath: string, note: string, imagePath: string, alt: string | undefined): Promise<string> {
   const files = await walkVault(vaultPath);
   const name = imagePath.slice(imagePath.lastIndexOf('/') + 1);
   const target = resolveTarget(name, files).length === 1 ? name : imagePath;
   const embed = alt === undefined ? `![[${target}]]` : `![[${target}|${alt}]]`;
 
-  await writeFile(note.full, `${note.markdown.replace(/\s*$/, '')}\n\n${embed}\n`, 'utf8');
+  // Read at the moment of writing, not when the call started.
+  const markdown = await readFile(note, 'utf8');
+  await writeFile(note, `${markdown.replace(/\s*$/, '')}\n\n${embed}\n`, 'utf8');
   return embed;
 }
 
